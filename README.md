@@ -70,7 +70,7 @@ python scripts/data_process/fineweb.py --num_samples=10000000 --min_length_for_m
 ```bash
 python scripts/data_process/daring_anteater.py --max_length=4096 --validation_size=2000
 python scripts/data_process/tulu.py --max_length=4096 --validation_size=2000
-python scripts/data_process/sum.py --max_length=4096 --validation_size=1000
+python scripts/data_process/xsum.py --max_length=4096 --validation_size=1000
 ```
 
 #### 2.3 QA Data Preparation
