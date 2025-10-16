@@ -114,7 +114,6 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 
 local_scripts/*
 *cache/*
-/data/
 result/
 dataset_cache/
 training_res/
