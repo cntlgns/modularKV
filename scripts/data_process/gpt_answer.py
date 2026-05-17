@@ -149,7 +149,7 @@ def write_jsonline(fp: str, obj: List[Any]):
 if __name__ == '__main__':
     random.seed(42)
     tqa_path = "FiD/open_domain_data/TQA/train.json"
-    wiki_path = "2WikiMultihopQA/train.parquet"
+    wiki_path = "data/raw/2wikimultihop/train.parquet"
     model_name = "facebook/contriever-msmarco"
     retrieval_tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_name)
     model: PreTrainedModel = AutoModel.from_pretrained(

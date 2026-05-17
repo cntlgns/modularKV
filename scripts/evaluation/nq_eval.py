@@ -55,6 +55,17 @@ parser.add_argument(
 )
 parser.add_argument("--reencode_num", type=int, default=5, help="Number of the link tokens.")
 parser.add_argument("--hf", type=bool, default=False, help="Use HuggingFace checkpoints.")
+parser.add_argument(
+    "--model_name",
+    type=str,
+    default="",
+    help="HF model/tokenizer id. Defaults to ckpt_path when --hf, else Llama-3.2-1B-Instruct.",
+)
+parser.add_argument(
+    "--gold_only",
+    action="store_true",
+    help="Feed only the gold (isgold) document instead of all 10 retrieved documents.",
+)
 
 args = parser.parse_args()
 
@@ -112,7 +123,7 @@ def best_subspan_em(prediction: str, ground_truths: List[str]) -> float:
             return 1.0
     return 0.0
 
-def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int):
+def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, gold_only: bool = False):
     system = (
         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a intelligent AI assistant. Please answer questions based on the user's instruction. "
         "Below are some reference documents that may help you in answering the user's question.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
@@ -120,17 +131,25 @@ def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_p
     question = example["question"]
     memory_list = []
 
-    doc_list = [example["ctxs"][x]["text"] for x in range(10)]
-    title_list  = [example["ctxs"][x]["title"] for x in range(10)]
-    # If target_position == 1, for example, then the code will read from the data source that
-    # always put groud-truth at position 0.
-    if target_position not in [0, 4, 9]:
-        ground_truth_doc = doc_list.pop(0)
-        ground_truth_title = title_list.pop(0)
-        doc_list.insert(target_position, ground_truth_doc)
-        title_list.insert(target_position, ground_truth_title)
+    if gold_only:
+        # Keep only the gold document(s); ignore distractors and position logic.
+        gold_ctxs = [c for c in example["ctxs"] if c.get("isgold")]
+        if not gold_ctxs:
+            gold_ctxs = [c for c in example["ctxs"] if c.get("hasanswer")]
+        doc_list = [c["text"] for c in gold_ctxs]
+        title_list = [c["title"] for c in gold_ctxs]
+    else:
+        doc_list = [example["ctxs"][x]["text"] for x in range(10)]
+        title_list  = [example["ctxs"][x]["title"] for x in range(10)]
+        # If target_position == 1, for example, then the code will read from the data source that
+        # always put groud-truth at position 0.
+        if target_position not in [0]:
+            ground_truth_doc = doc_list.pop(0)
+            ground_truth_title = title_list.pop(0)
+            doc_list.insert(target_position, ground_truth_doc)
+            title_list.insert(target_position, ground_truth_title)
 
-    for j in range(0,10):
+    for j in range(len(doc_list)):
         title = title_list[j]
         text = doc_list[j]
         memory_list.append(f"Document [{j+1}](Title: {title}) {text}\n")
@@ -199,7 +218,7 @@ def main():
     mem_end = 128255
     special_token_start = 128011
 
-    if pos in [0, 4, 9]:
+    if pos in [0]:
         data_path = f"data/raw/nq/nq-open-10_{pos}.jsonl"
     else:
         data_path = "data/raw/nq/nq-open-10_0.jsonl"
@@ -209,22 +228,28 @@ def main():
     print(all_answers[:10])
 
     # tokenizer = LLaMA32Tokenizer(model_path="data/titan_tokenizer/original/tokenizer.model")
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-    tokenizer.pad_token_id = 128004
-    tokenizer.pad_token = "<|finetune_right_pad_id|>"
-
-    model = LlamaForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct",
-        torch_dtype=torch.bfloat16,
-        # torch_dtype=torch.float32,
-    )
-    # model.load_state_dict(state_dict, strict=True)
-
-    if args.ckpt_path is None:
-        print("Will NOT load fine-tuned models!")
-    elif hf:
-        model = AutoModelForCausalLM.from_pretrained(args.ckpt_path, torch_dtype=torch.bfloat16)
+    model_name = args.model_name or (args.ckpt_path if (hf and args.ckpt_path) else "meta-llama/Llama-3.2-1B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if "Llama-3.2" in model_name:
+        # Original KVLink setup: reserved Llama-3.2 special-token ids.
+        tokenizer.pad_token_id = 128004
+        tokenizer.pad_token = "<|finetune_right_pad_id|>"
     else:
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        # Re-map segment sentinels into this model's own vocab range.
+        vocab_size = len(tokenizer)
+        mem_start = vocab_size - 2
+        mem_end = vocab_size - 1
+        special_token_start = vocab_size - 2 - 1024
+
+    if hf and args.ckpt_path is not None:
+        model = AutoModelForCausalLM.from_pretrained(args.ckpt_path, torch_dtype=torch.bfloat16)
+    elif args.ckpt_path is None:
+        print("Will NOT load fine-tuned models! Evaluating pretrained model_name directly.")
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    else:
+        model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         state_dict = load_model_weights(ckpt_path)
         model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
@@ -242,7 +267,8 @@ def main():
             reencode_num=reencode_num,
             mem_start=mem_start,
             mem_end=mem_end,
-            special_token_start=special_token_start
+            special_token_start=special_token_start,
+            gold_only=args.gold_only,
         ),
     )
 
@@ -345,16 +371,29 @@ def main():
     current_time = datetime.datetime.now()
     time_str = current_time.strftime("%Y%m%d-%H%M%S")
 
-    file_name = f"result/NQ_at{pos}_{accuracy}_{time_str}.jsonl"
-    if not os.path.exists(os.path.dirname(file_name)):
-        os.makedirs(os.path.dirname(file_name))
+    state = "goldonly" if args.gold_only else f"at{pos}"
+    model_slug = model_name.split("/")[-1]
+    # Deterministic, ablation-unique stem: distinct experiments never overwrite
+    # each other, and sweep_ablation.py skips a job whose .jsonl already exists.
+    # accuracy/timestamp live in the sidecar .summary.json, not the filename.
+    stem = f"NQ_{model_slug}_{state}_attn-{args.attn_type}_re{reencode_num}"
+    file_name = f"result/{stem}.jsonl"
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
     with open(file_name, "w", encoding="utf-8") as f:
         for entry in res_list:
-            json_line = json.dumps(entry)
-            f.write(json_line + "\n")
+            f.write(json.dumps(entry) + "\n")
 
-    print(f"Dumped at {file_name}")
+    summary = {
+        "stem": stem, "benchmark": "NQ", "model": model_name,
+        "state": state, "attn_type": args.attn_type,
+        "reencode_num": reencode_num, "accuracy": accuracy,
+        "num_examples": total_num, "timestamp": time_str,
+    }
+    with open(f"result/{stem}.summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Dumped at {file_name}  (acc={accuracy})")
 
 if __name__ == "__main__":
     main()

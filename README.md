@@ -78,7 +78,7 @@ python scripts/data_process/xsum.py --max_length=4096 --validation_size=1000
 Our QA training data is built upon the **2WikiMultiHopQA** and **TriviaQA** datasets. To access the original **2WikiMultiHopQA** dataset, use:
 
 ```bash
-git clone https://huggingface.co/datasets/xanhho/2WikiMultihopQA
+git clone https://huggingface.co/datasets/xanhho/2WikiMultihopQA data/raw/2wikimultihop
 ```
 
 For the **TriviaQA** dataset, run:

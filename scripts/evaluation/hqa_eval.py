@@ -53,6 +53,17 @@ parser.add_argument(
 )
 parser.add_argument("--reencode_num", type=int, default=5, help="Number of the link tokens.")
 parser.add_argument("--hf", type=bool, default=False, help="Use HuggingFace checkpoints.")
+parser.add_argument(
+    "--model_name",
+    type=str,
+    default="",
+    help="HF model/tokenizer id. Defaults to ckpt_path when --hf, else Llama-3.2-1B-Instruct.",
+)
+parser.add_argument(
+    "--gold_only",
+    action="store_true",
+    help="Feed only the gold (supporting) documents instead of all distractor documents.",
+)
 
 args = parser.parse_args()
 
@@ -110,7 +121,7 @@ def best_subspan_em(prediction: str, ground_truths: List[str]) -> float:
             return 1.0
     return 0.0
 
-def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int):
+def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, gold_only: bool = False):
     system = (
         "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a intelligent AI assistant. Please answer questions based on the user's instruction. "
         "Below are some reference documents that may help you in answering the user's question.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
@@ -118,10 +129,13 @@ def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, reencode
     question = example["question"]
     memory_list = []
 
+    gold_titles = set(example['supporting_facts']['title']) if gold_only else None
     for j in range(len(example['context']['title'])):
         title = example['context']['title'][j]
+        if gold_only and title not in gold_titles:
+            continue
         text = ''.join(example['context']['sentences'][j])
-        memory_list.append(f"Document [{j+1}](Title: {title}) {text}\n")
+        memory_list.append(f"Document [{len(memory_list)+1}](Title: {title}) {text}\n")
 
     qa_system_input_ids = tokenizer(system, add_special_tokens = False)["input_ids"]
     input_ids = qa_system_input_ids[:] + [mem_start]
@@ -191,22 +205,28 @@ def main():
     all_answers = dataset["answer"]
     print(all_answers[:10])
 
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B-Instruct")
-    tokenizer.pad_token_id = 128004
-    tokenizer.pad_token = "<|finetune_right_pad_id|>"
-
-    model = LlamaForCausalLM.from_pretrained(
-        "meta-llama/Llama-3.2-1B-Instruct",
-        torch_dtype=torch.bfloat16,
-        # torch_dtype=torch.float32,
-    )
-    # model.load_state_dict(state_dict, strict=True)
-
-    if args.ckpt_path is None:
-        print("Will NOT load fine-tuned models!")
-    elif hf:
-        model = AutoModelForCausalLM.from_pretrained(args.ckpt_path, torch_dtype=torch.bfloat16)
+    model_name = args.model_name or (args.ckpt_path if (hf and args.ckpt_path) else "meta-llama/Llama-3.2-1B-Instruct")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    if "Llama-3.2" in model_name:
+        # Original KVLink setup: reserved Llama-3.2 special-token ids.
+        tokenizer.pad_token_id = 128004
+        tokenizer.pad_token = "<|finetune_right_pad_id|>"
     else:
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        # Re-map segment sentinels into this model's own vocab range.
+        vocab_size = len(tokenizer)
+        mem_start = vocab_size - 2
+        mem_end = vocab_size - 1
+        special_token_start = vocab_size - 2 - 1024
+
+    if hf and args.ckpt_path is not None:
+        model = AutoModelForCausalLM.from_pretrained(args.ckpt_path, torch_dtype=torch.bfloat16)
+    elif args.ckpt_path is None:
+        print("Will NOT load fine-tuned models! Evaluating pretrained model_name directly.")
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
+    else:
+        model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.bfloat16)
         state_dict = load_model_weights(ckpt_path)
         model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
@@ -223,7 +243,8 @@ def main():
             reencode_num=reencode_num,
             mem_start=mem_start,
             mem_end=mem_end,
-            special_token_start=special_token_start
+            special_token_start=special_token_start,
+            gold_only=args.gold_only,
         ),
     )
 
@@ -326,16 +347,29 @@ def main():
     current_time = datetime.datetime.now()
     time_str = current_time.strftime("%Y%m%d-%H%M%S")
 
-    file_name = f"result/hqa_{accuracy}_{time_str}.jsonl"
-    if not os.path.exists(os.path.dirname(file_name)):
-        os.makedirs(os.path.dirname(file_name))
+    state = "goldonly" if args.gold_only else "all"
+    model_slug = model_name.split("/")[-1]
+    # Deterministic, ablation-unique stem: distinct experiments never overwrite
+    # each other, and sweep_ablation.py skips a job whose .jsonl already exists.
+    # accuracy/timestamp live in the sidecar .summary.json, not the filename.
+    stem = f"hqa_{model_slug}_{state}_attn-{args.attn_type}_re{reencode_num}"
+    file_name = f"result/{stem}.jsonl"
+    os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
     with open(file_name, "w", encoding="utf-8") as f:
         for entry in res_list:
-            json_line = json.dumps(entry)
-            f.write(json_line + "\n")
+            f.write(json.dumps(entry) + "\n")
 
-    print(f"Dumped at {file_name}")
+    summary = {
+        "stem": stem, "benchmark": "hqa", "model": model_name,
+        "state": state, "attn_type": args.attn_type,
+        "reencode_num": reencode_num, "accuracy": accuracy,
+        "num_examples": total_num, "timestamp": time_str,
+    }
+    with open(f"result/{stem}.summary.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Dumped at {file_name}  (acc={accuracy})")
 
 if __name__ == "__main__":
     main()
