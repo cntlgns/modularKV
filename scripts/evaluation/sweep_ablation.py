@@ -3,7 +3,7 @@ SLURM launcher: modularization ablation for a pretrained (non-fine-tuned) model.
 
 Submits one single-GPU job per experiment in the matrix
 
-    models x benchmarks x doc-modes x attn-types  (+ NQ gold-position sweep)
+    models x benchmarks x doc-modes x kv-policies  (+ NQ gold-position sweep)
 
 Each job runs scripts/evaluation/run_eval.sh, which loads the pretrained HF
 model and evaluates it on one benchmark in one document mode.
@@ -12,16 +12,21 @@ Matrix (edit the constants below to change it):
   - MODELS:      Llama-3.2-1B-Instruct, Llama-3.1-8B-Instruct
   - BENCHMARKS:  nq, hqa, wiki, musique
   - MODES:       all (all retrieved docs), gold (gold/supporting docs only)
-  - ATTN_TYPES:  standard (full causal), blocked (per-document segment mask
-                 via make_segment_mask; no link tokens since reencode_num=0)
+  - KV_POLICIES: baseline, recover_pos_enc, modular, recover_cross_attn,
+                 recover_cross_attn_oracle_pos (== legacy standard/blocked +
+                 3 new). reencode_num=0 (no link tokens).
+  - MODULAR_Q_POS: summed_pos (+ optionally min_pos); only modular /
+                 recover_cross_attn expand over it.
+  - PROMPT_PRESETS: kvlink (default; stem unchanged) (+ optionally short =
+                 short-answer system prompt, stem gets _p-short).
   - NQ "all":    sweeps gold-doc position in NQ_POS_SWEEP; every other
                  (bench, mode) pair is a single job.
-  => 2 x 2attn x (nq:3+1 + hqa:2 + wiki:2 + musique:2) = 40 jobs (wiki
-     auto-skipped until data/raw/2wikimultihop/dev.json exists).
+  Job count = |MODELS| x |KV_POLICIES (+qpos expansion)| x sum over benches
+  (wiki auto-skipped until data/raw/2wikimultihop/dev.json exists).
 
 Idempotent: each experiment writes a deterministic, ablation-unique
-result/<stem>.jsonl (+ <stem>.summary.json with accuracy/timestamp) where
-stem = {BENCH}_{model}_{state}_attn-{attn}_re{reencode}. A combo whose
+result/ablation/<stem>.jsonl (+ <stem>.summary.json with accuracy/timestamp) where
+stem = {BENCH}_{model}_{state}_kv-{policy}[-{qpos}][_p-{preset}]_re{reencode}. A combo whose
 .jsonl already exists is skipped (pass --force to rerun it anyway), so a
 re-run only fills in missing/failed experiments.
 
@@ -51,11 +56,32 @@ MODELS = [
     "meta-llama/Llama-3.2-1B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct",
 ]
-BENCHMARKS = ["nq", "hqa", "wiki", "musique"]
-MODES = ["all", "gold"]
+BENCHMARKS = ["wiki"] # "nq", "hqa", "wiki", "musique"
+MODES = ["all", "gold"] # "all", "gold"
 NQ_POS_SWEEP = [0, 4, 9]      # only for NQ "all docs"
 
-ATTN_TYPES = ["standard", "blocked"]   # full-causal vs per-document block mask
+# KV-cache modularization policies (names shared with the
+# modularization_ablation repo). Legacy aliases standard==baseline,
+# blocked==recover_pos_enc still accepted by the eval scripts.
+KV_POLICIES = [
+    "baseline",
+    "recover_pos_enc",
+    "modular",
+    "recover_cross_attn",
+    "recover_cross_attn_oracle_pos",
+]
+# Question RoPE placement; only modular / recover_cross_attn are affected, and
+# only those policies expand over this list (others use summed_pos as a no-op).
+MODULAR_Q_POS = ["summed_pos"]  # add "min_pos" to sweep both
+# Policies whose stem carries a -{modular_q_pos} suffix. MUST stay in sync
+# with src/kvmod/policies.py:POLICIES_WITH_MODULAR_Q_POS (not imported here so
+# --dry-run works without torch).
+_POLICIES_WITH_QPOS = {"modular", "recover_cross_attn"}
+# System-prompt preset. 'kvlink' == original wording (stem unchanged, keeps
+# the in-flight comparison valid); 'short' == short-answer prompt (EM/F1↑),
+# stem gets a _p-short suffix. MUST stay in sync with
+# src/kvmod/prompt.py:PROMPT_PRESETS.
+PROMPT_PRESETS = ["kvlink", "short"]  # both system-prompt presets
 REENCODE_NUM = 0              # 0 = no link tokens (clean untrained baseline)
 
 # Eval batch size = 1 for everything: zero OOM risk on a 24GB 3090 regardless
@@ -69,9 +95,11 @@ BATCH_SIZE = 1
 BENCH_TOKEN = {"nq": "NQ", "hqa": "hqa", "wiki": "wiki", "musique": "musique"}
 
 
-def result_stem(bench: str, model: str, mode: str, pos: int, attn_type: str) -> str:
+def result_stem(bench: str, model: str, mode: str, pos: int,
+                 policy: str, modular_q_pos: str,
+                 prompt_preset: str = "kvlink") -> str:
     """Deterministic result stem — MUST stay in sync with the *_eval.py scripts:
-    result/{stem}.jsonl  (+ {stem}.summary.json)."""
+    result/ablation/{stem}.jsonl  (+ {stem}.summary.json)."""
     model_slug = model.split("/")[-1]
     if mode == "gold":
         state = "goldonly"
@@ -79,8 +107,10 @@ def result_stem(bench: str, model: str, mode: str, pos: int, attn_type: str) -> 
         state = f"at{pos}"
     else:
         state = "all"
+    qpos = f"-{modular_q_pos}" if policy in _POLICIES_WITH_QPOS else ""
+    ppx = "" if prompt_preset == "kvlink" else f"_p-{prompt_preset}"
     return (f"{BENCH_TOKEN[bench]}_{model_slug}_{state}"
-            f"_attn-{attn_type}_re{REENCODE_NUM}")
+            f"_kv-{policy}{qpos}{ppx}_re{REENCODE_NUM}")
 
 
 def build_combos(force: bool = False):
@@ -103,19 +133,35 @@ def build_combos(force: bool = False):
                 else:
                     positions = [0]
                 for pos in positions:
-                    for attn_type in ATTN_TYPES:
-                        stem = result_stem(bench, model, mode, pos, attn_type)
-                        done = os.path.isfile(
-                            os.path.join(PROJECT_DIR, "result", f"{stem}.jsonl")
+                    for policy in KV_POLICIES:
+                        # Only reset-to-zero policies vary with modular_q_pos;
+                        # others run once (summed_pos as a no-op).
+                        qpos_list = (
+                            MODULAR_Q_POS
+                            if policy in _POLICIES_WITH_QPOS
+                            else ["summed_pos"]
                         )
-                        if done and not force:
-                            print(f"  [skip] {stem} (result already exists; "
-                                  f"--force to rerun)")
-                            continue
-                        combos.append(
-                            f"{SCRIPT_PATH} {bench} {model} {mode} "
-                            f"{pos} {bsz} {attn_type} {REENCODE_NUM}"
-                        )
+                        for qpos in qpos_list:
+                            for preset in PROMPT_PRESETS:
+                                stem = result_stem(
+                                    bench, model, mode, pos, policy, qpos,
+                                    preset,
+                                )
+                                done = os.path.isfile(
+                                    os.path.join(
+                                        PROJECT_DIR, "result", "ablation",
+                                        f"{stem}.jsonl"
+                                    )
+                                )
+                                if done and not force:
+                                    print(f"  [skip] {stem} (result already "
+                                          f"exists; --force to rerun)")
+                                    continue
+                                combos.append(
+                                    f"{SCRIPT_PATH} {bench} {model} {mode} "
+                                    f"{pos} {bsz} {policy} {qpos} {preset} "
+                                    f"{REENCODE_NUM}"
+                                )
     return combos
 
 
@@ -150,7 +196,7 @@ def run_slurm(only: str = "", dry_run: bool = False, force: bool = False):
         qos="normal",
         timeout="1-0",
         job_name="kvlink_ablation",
-        max_job_num=40,
+        max_job_num=80,
         # part_to_py is a no-op here: select_env_wrap.py only rewrites a
         # literal "python" in base_cmd, and base_cmd is "bash". The eval
         # interpreter is pinned inside run_eval.sh ($PROJECT_ROOT/.venv).

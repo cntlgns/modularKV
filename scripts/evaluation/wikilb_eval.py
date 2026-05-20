@@ -1,30 +1,28 @@
 """
-Evaluate the performance of LLMs fine-tuned via TorchTitan on musique dataset.
+2WikiMQA evaluation on the **LongBench** `2wikimqa` subset (~200 curated,
+pre-packed examples) instead of the full official dev (12,576 / 10-doc) that
+wiki_eval.py uses. Everything else (prompt_preset, build_segmented_inputs,
+generate_for_policy, substring metric, greedy/stop, max_new_tokens=200) is
+byte-identical to wiki_eval.py so the ONLY changed variable is the 2wiki
+eval-set construction. Used to test whether the paper's Table-1
+Llama-3.2-1B 2WikiMQA number comes from a LongBench-style eval set.
 
-1. Convert the Titan checkpoint from DCP to torch:
-```
-python -m torch.distributed.checkpoint.format_utils dcp_to_torch \
-    torchtitan/outputs/checkpoint/step-1000 checkpoint.pt
-```
-
-2. Run evaluation:
-```
-python scripts/evaluation/musique_eval.py \
-    --ckpt_path checkpoint.pt \
-    --batch_size 10 \
-    --reencode_num 5 \
-    --attn_type "blocked" \
-```
+Run via run_eval.sh with BENCH=wikilb (resolves scripts/evaluation/wikilb_eval.py).
+gold_only is not meaningful here (LongBench has no per-doc supporting_facts).
 """
 import argparse
 import datetime
 import json
 import os
+import re
+import zipfile
+from pathlib import Path
 from typing import Dict, List
 
 import datasets
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from torch.utils.data import DataLoader
 from torchtune.models.convert_weights import tune_to_hf
@@ -45,6 +43,74 @@ from src.utils.metrics import score_sample
 
 # Legacy --attn_type aliases (pre-5-policy refactor).
 _POLICY_ALIASES = {"standard": "baseline", "blocked": "recover_pos_enc"}
+
+# ---- LongBench loader (ported verbatim from the modularization_ablation repo,
+#      commit 99d6dc0 "Fix LongBench loader") ----------------------------------
+# LongBench concatenates passages with "Passage N:\n..." (numbered for the
+# multi-doc QA tasks). A single leading newline is the actual delimiter.
+_PASSAGE_RE = re.compile(r"\nPassage(?: \d+)?:\n")
+_LEADING_PASSAGE_RE = re.compile(r"^Passage(?: \d+)?:\n")
+_LONGBENCH_REPO = "THUDM/LongBench"
+_LONGBENCH_ZIP = "data.zip"
+
+
+def _split_passages(context: str) -> List[str]:
+    leading = _LEADING_PASSAGE_RE.match(context)
+    if leading:
+        context = context[leading.end():]
+    parts = _PASSAGE_RE.split(context)
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts if parts else [context.strip()]
+
+
+def _ensure_longbench_extracted() -> Path:
+    zip_path = Path(hf_hub_download(
+        repo_id=_LONGBENCH_REPO, filename=_LONGBENCH_ZIP, repo_type="dataset",
+    ))
+    extract_dir = zip_path.parent / "_extracted"
+    sentinel = extract_dir / ".done"
+    # Idempotent + concurrency-safe: if the target is already extracted (by a
+    # prior or sibling job sharing this HF cache) just use it. extractall is
+    # NOT safe to run concurrently (os.mkdir w/o exist_ok on member dirs), so
+    # we tolerate FileExistsError and fall through to the existence check.
+    for candidate in (extract_dir / "data", extract_dir):
+        if (candidate / "2wikimqa.jsonl").exists():
+            return candidate
+    if not sentinel.exists():
+        extract_dir.mkdir(exist_ok=True)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.extractall(extract_dir)
+            sentinel.touch()
+        except FileExistsError:
+            pass  # a sibling job is extracting into the same cache; re-check.
+    for candidate in (extract_dir / "data", extract_dir):
+        if (candidate / "2wikimqa.jsonl").exists():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not locate 2wikimqa.jsonl under {extract_dir}; "
+        f"LongBench zip layout may have changed."
+    )
+
+
+def load_longbench_2wikimqa() -> List[Dict]:
+    """Return [{question, passages:list[str], answers:list[str]}] for the
+    LongBench 2wikimqa subset (order preserved, no subsampling)."""
+    jsonl_path = _ensure_longbench_extracted() / "2wikimqa.jsonl"
+    records = []
+    with open(jsonl_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            row = json.loads(line)
+            answers = row.get("answers") or [row.get("answer", "")]
+            if isinstance(answers, str):
+                answers = [answers]
+            records.append({
+                "question": row["input"],
+                "passages": _split_passages(row["context"]),
+                "answers": answers,
+            })
+    return records
+# -----------------------------------------------------------------------------
 
 parser = argparse.ArgumentParser(description="Run script with specified ckpt.")
 parser.add_argument(
@@ -91,7 +157,7 @@ parser.add_argument(
 parser.add_argument(
     "--gold_only",
     action="store_true",
-    help="Feed only the gold (is_supporting) paragraphs instead of all paragraphs.",
+    help="Not supported for LongBench (no per-doc supporting_facts); raises.",
 )
 
 args = parser.parse_args()
@@ -119,19 +185,18 @@ def load_model_weights(ckpt_path: str):
     )
     return converted_state_dict
 
-# QA metrics (normalize_answer / best_subspan_em / exact_match / f1_score)
-# were consolidated into src.utils.metrics -- see score_sample, imported above.
-# substring accuracy is byte-for-byte unchanged from the old inline version.
+# QA metrics consolidated in src.utils.metrics -- substring accuracy is
+# byte-for-byte identical to wiki_eval.py (same score_sample).
 
 def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, prompt_preset: str = "kvlink", gold_only: bool = False):
+    if gold_only:
+        raise NotImplementedError(
+            "gold_only is undefined for LongBench 2wikimqa (no supporting_facts)."
+        )
     question = example["question"]
-    docs = []
-    for j in range(len(example['paragraphs'])):
-        if gold_only and not example['paragraphs'][j].get('is_supporting'):
-            continue
-        title = example['paragraphs'][j]['title']
-        text = example['paragraphs'][j]['paragraph_text']
-        docs.append((title, text))
+    # LongBench passages have no separate titles; pass empty title so doc
+    # rendering is identical structure to wiki_eval ((title, text) tuples).
+    docs = [("", p) for p in example["passages"]]
 
     return build_segmented_inputs(
         tokenizer, question, docs,
@@ -156,8 +221,6 @@ class DataCollatorForGeneration():
             seq_length = len(item['input_ids'])
 
             residual = max_length - seq_length
-            # padded_input_ids = [self.pad_id] * residual + item['input_ids']
-            # curr_attention_mask = [0] * residual + [1] * seq_length
             padded_input_ids = item['input_ids'] + [self.pad_id] * residual
             curr_attention_mask = [1] * seq_length + [0] * residual
             input_ids.append(padded_input_ids)
@@ -175,17 +238,21 @@ def main():
     ckpt_path = args.ckpt_path
     reencode_num: int  = args.reencode_num
     batch_size: int = args.batch_size
-    device = torch.device("cuda")
     hf: bool = args.hf
     policy = _POLICY_ALIASES.get(args.kv_policy, args.kv_policy)
+
+    device = torch.device("cuda")
 
     mem_start = 128254
     mem_end = 128255
     special_token_start = 128011
 
-    dataset = datasets.load_dataset("dgslibisey/MuSiQue", split='validation')
+    records = load_longbench_2wikimqa()
+    dataset = datasets.Dataset.from_list(records)
     print(dataset)
-    all_answers = dataset["answer"]
+    # Reference answers: LongBench ships a *list* per example -> substring-EM
+    # over the whole list (paper-consistent, same metric as wiki_eval).
+    all_answers = [r["answers"] for r in records]
     print(all_answers[:10])
 
     model_name = args.model_name or (args.ckpt_path if (hf and args.ckpt_path) else "meta-llama/Llama-3.2-1B-Instruct")
@@ -243,9 +310,6 @@ def main():
     eval_dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
     prog_bar = auto_tqdm(range(len(eval_dataloader)))
 
-    # Greedy stop ids: original eval used GenerationConfig(eos=<|eot_id|>,
-    # stop_strings=["<|end_of_text|>","<|eot_id|>"]). The kvmod greedy loop
-    # stops on these ids (token-for-token identical to the old greedy decode).
     stop_token_ids = {
         i for i in (
             tokenizer.convert_tokens_to_ids("<|eot_id|>"),
@@ -279,14 +343,14 @@ def main():
             print("Ground-truth: ", batch_answers[idx])
             print("------\n")
 
-        scored = [score_sample(responses[idx], [batch_answers[idx]]) for idx in range(curr_batch_size)]
+        # batch_answers[idx] is itself the list of references for that example.
+        scored = [score_sample(responses[idx], batch_answers[idx]) for idx in range(curr_batch_size)]
         for idx, s in enumerate(scored):
             correct_num = correct_num + int(s["substring"])
             em_sum = em_sum + s["em"]
             f1_sum = f1_sum + s["f1"]
             res_list.append(
                 {
-                    # "question": question,
                     "response": responses[idx],
                     "gold_answer": batch_answers[idx],
                     "score": s["substring"],
@@ -305,15 +369,12 @@ def main():
     current_time = datetime.datetime.now()
     time_str = current_time.strftime("%Y%m%d-%H%M%S")
 
-    state = "goldonly" if args.gold_only else "all"
+    state = "all"  # LongBench packs all retrieved passages; gold_only N/A
     model_slug = model_name.split("/")[-1]
-    # Deterministic, ablation-unique stem: distinct experiments never overwrite
-    # each other, and sweep_ablation.py skips a job whose .jsonl already exists.
-    # accuracy/timestamp live in the sidecar .summary.json, not the filename.
-    # Keep in sync with sweep_ablation.result_stem().
     qpos = f"-{args.modular_q_pos}" if policy in POLICIES_WITH_MODULAR_Q_POS else ""
     ppx = "" if args.prompt_preset == "kvlink" else f"_p-{args.prompt_preset}"
-    stem = f"musique_{model_slug}_{state}_kv-{policy}{qpos}{ppx}_re{reencode_num}"
+    # Distinct "wikilb_" prefix -> never collides with wiki_ official-dev runs.
+    stem = f"wikilb_{model_slug}_{state}_kv-{policy}{qpos}{ppx}_re{reencode_num}"
     file_name = f"result/ablation/{stem}.jsonl"
     os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
@@ -322,7 +383,7 @@ def main():
             f.write(json.dumps(entry) + "\n")
 
     summary = {
-        "stem": stem, "benchmark": "musique", "model": model_name,
+        "stem": stem, "benchmark": "wikilb", "model": model_name,
         "state": state, "kv_policy": policy, "modular_q_pos": args.modular_q_pos,
         "prompt_preset": args.prompt_preset,
         "reencode_num": reencode_num,

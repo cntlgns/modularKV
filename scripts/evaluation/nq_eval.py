@@ -21,12 +21,10 @@ import argparse
 import datetime
 import json
 import os
-import string
 from typing import Dict, List
 
 import datasets
 import numpy as np
-import regex
 import torch
 from safetensors import safe_open
 from torch.utils.data import DataLoader
@@ -35,7 +33,19 @@ from tqdm.auto import tqdm as auto_tqdm
 from transformers import AutoTokenizer, GenerationConfig, LlamaForCausalLM, AutoModelForCausalLM
 
 from src.common import move_to_target_device
-from src.data.titan_preprocessor import LLaMA32Tokenizer, make_segment_mask
+from src.data.titan_preprocessor import LLaMA32Tokenizer
+from src.kvmod import (
+    KV_CACHE_POLICIES,
+    MODULAR_Q_POS_CHOICES,
+    POLICIES_WITH_MODULAR_Q_POS,
+    PROMPT_PRESETS,
+    build_segmented_inputs,
+    generate_for_policy,
+)
+from src.utils.metrics import score_sample
+
+# Legacy --attn_type aliases (pre-5-policy refactor).
+_POLICY_ALIASES = {"standard": "baseline", "blocked": "recover_pos_enc"}
 
 parser = argparse.ArgumentParser(description="Run script with specified ckpt and pos.")
 parser.add_argument(
@@ -47,11 +57,30 @@ parser.add_argument(
 parser.add_argument("--pos", type=int, required=True, help="Position value")
 parser.add_argument("--batch_size", type=int, default=1, help="Batch size of the evaluation.")
 parser.add_argument(
-    "--attn_type",
+    "--kv_policy",
     type=str,
     required=True,
-    help="attention types.",
-    choices=["standard", "blocked"],
+    help="KV-cache modularization policy (5 names shared with the "
+    "modularization_ablation repo). 'standard'/'blocked' are accepted as "
+    "legacy aliases for 'baseline'/'recover_pos_enc'.",
+    choices=list(KV_CACHE_POLICIES) + list(_POLICY_ALIASES),
+)
+parser.add_argument(
+    "--modular_q_pos",
+    type=str,
+    default="summed_pos",
+    choices=list(MODULAR_Q_POS_CHOICES),
+    help="Question RoPE placement for reset-to-zero policies "
+    "(modular / recover_cross_attn); ignored otherwise.",
+)
+parser.add_argument(
+    "--prompt_preset",
+    type=str,
+    default="kvlink",
+    choices=list(PROMPT_PRESETS),
+    help="System-prompt preset. 'kvlink' = original wording (default, "
+    "byte-identical to pre-refactor). 'short' = short-answer system prompt "
+    "(higher EM/F1). Doc rendering / framing unchanged either way.",
 )
 parser.add_argument("--reencode_num", type=int, default=5, help="Number of the link tokens.")
 parser.add_argument("--hf", type=bool, default=False, help="Use HuggingFace checkpoints.")
@@ -92,52 +121,19 @@ def load_model_weights(ckpt_path: str):
     )
     return converted_state_dict
 
-def normalize_answer(s: str) -> str:
-    """Normalization from the SQuAD evaluation script.
+# QA metrics (normalize_answer / best_subspan_em / exact_match / f1_score)
+# were consolidated into src.utils.metrics -- see score_sample, imported above.
+# substring accuracy is byte-for-byte unchanged from the old inline version.
 
-    See https://worksheets.codalab.org/rest/bundles/0x6b567e1cf2e041ec80d7098f031c5c9e/contents/blob/
-    """
-
-    def remove_articles(text):
-        return regex.sub(r"\b(a|an|the)\b", " ", text)
-
-    def white_space_fix(text):
-        return " ".join(text.split())
-
-    def remove_punc(text):
-        exclude = set(string.punctuation)
-        return "".join(ch for ch in text if ch not in exclude)
-
-    def lower(text):
-        return text.lower()
-
-    return white_space_fix(remove_articles(remove_punc(lower(s))))
-
-
-def best_subspan_em(prediction: str, ground_truths: List[str]) -> float:
-    normalized_prediction = normalize_answer(prediction)
-
-    for ground_truth in ground_truths:
-        normalized_ground_truth = normalize_answer(ground_truth)
-        if normalized_ground_truth.lower() in normalized_prediction.lower():
-            return 1.0
-    return 0.0
-
-def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, gold_only: bool = False):
-    system = (
-        "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nYou are a intelligent AI assistant. Please answer questions based on the user's instruction. "
-        "Below are some reference documents that may help you in answering the user's question.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n"
-    )
+def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, prompt_preset: str = "kvlink", gold_only: bool = False):
     question = example["question"]
-    memory_list = []
 
     if gold_only:
         # Keep only the gold document(s); ignore distractors and position logic.
         gold_ctxs = [c for c in example["ctxs"] if c.get("isgold")]
         if not gold_ctxs:
             gold_ctxs = [c for c in example["ctxs"] if c.get("hasanswer")]
-        doc_list = [c["text"] for c in gold_ctxs]
-        title_list = [c["title"] for c in gold_ctxs]
+        docs = [(c["title"], c["text"]) for c in gold_ctxs]
     else:
         doc_list = [example["ctxs"][x]["text"] for x in range(10)]
         title_list  = [example["ctxs"][x]["title"] for x in range(10)]
@@ -148,32 +144,14 @@ def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_p
             ground_truth_title = title_list.pop(0)
             doc_list.insert(target_position, ground_truth_doc)
             title_list.insert(target_position, ground_truth_title)
+        docs = list(zip(title_list, doc_list))
 
-    for j in range(len(doc_list)):
-        title = title_list[j]
-        text = doc_list[j]
-        memory_list.append(f"Document [{j+1}](Title: {title}) {text}\n")
-
-    qa_system_input_ids = tokenizer(system, add_special_tokens = False)["input_ids"]
-    input_ids = qa_system_input_ids[:] + [mem_start]
-    segment_ids = [0] * len(input_ids)
-
-    for mem_id, st in enumerate(memory_list):
-        tem_id = tokenizer(st, add_special_tokens = False)["input_ids"]
-        segment_ids = segment_ids + [mem_id + 1] * len(tem_id) + [0] * reencode_num
-
-        for sub_idx in range(reencode_num):
-            tem_id = tem_id + [special_token_start + reencode_num * mem_id + sub_idx]
-        input_ids = input_ids + tem_id
-
-    new_prompt = question
-    prompt_id = tokenizer(new_prompt, add_special_tokens = False)["input_ids"]
-    input_ids = input_ids + [mem_end] + prompt_id
-    segment_ids = segment_ids + [0] + [0] * len(prompt_id)
-    return {
-        "input_ids": input_ids,
-        "segment_ids": segment_ids,
-    }
+    return build_segmented_inputs(
+        tokenizer, question, docs,
+        prompt_preset=prompt_preset, reencode_num=reencode_num,
+        mem_start=mem_start, mem_end=mem_end,
+        special_token_start=special_token_start,
+    )
 
 class DataCollatorForGeneration():
     def __init__(self, pad_id: int):
@@ -212,6 +190,7 @@ def main():
     reencode_num: int  = args.reencode_num
     batch_size: int = args.batch_size
     hf: bool = args.hf
+    policy = _POLICY_ALIASES.get(args.kv_policy, args.kv_policy)
     device = torch.device("cuda")
 
     mem_start = 128254
@@ -268,6 +247,7 @@ def main():
             mem_start=mem_start,
             mem_end=mem_end,
             special_token_start=special_token_start,
+            prompt_preset=args.prompt_preset,
             gold_only=args.gold_only,
         ),
     )
@@ -275,98 +255,72 @@ def main():
     total_num = 500
     dataset = dataset.select(np.arange(total_num))
     correct_num = 0
+    em_sum = 0.0
+    f1_sum = 0.0
     res_list = []
 
     collate_fn = DataCollatorForGeneration(pad_id=tokenizer.pad_token_id)
     eval_dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
     prog_bar = auto_tqdm(range(len(eval_dataloader)))
 
-    eot_id = tokenizer.convert_tokens_to_ids("<|eot_id|>")
-    print(eot_id)
-    generation_cfg = GenerationConfig(
-        do_sample=False,
-        num_beams=1,
-        max_new_tokens=200,
-        stop_strings=["<|end_of_text|>", "<|eot_id|>"],
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=eot_id,
-    )
+    # Greedy stop ids: original eval used GenerationConfig(eos=<|eot_id|>,
+    # stop_strings=["<|end_of_text|>","<|eot_id|>"]). The kvmod greedy loop
+    # stops on these ids (token-for-token identical to the old greedy decode).
+    stop_token_ids = {
+        i for i in (
+            tokenizer.convert_tokens_to_ids("<|eot_id|>"),
+            tokenizer.convert_tokens_to_ids("<|end_of_text|>"),
+            tokenizer.eos_token_id,
+        ) if i is not None and i >= 0
+    }
     generation_prompt = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-
     generation_token_ids = tokenizer(generation_prompt, add_special_tokens=False)["input_ids"]
-    print(generation_token_ids)
     generation_token_ids = torch.LongTensor(generation_token_ids)
-    generation_token_ids: torch.LongTensor = move_to_target_device(generation_token_ids, device)
+    generation_token_ids = move_to_target_device(generation_token_ids, device)
 
     for batch_id, batch in enumerate(eval_dataloader):
         curr_batch_size = batch['input_ids'].size(0)
         batch_answers = all_answers[batch_id * batch_size : batch_id * batch_size + curr_batch_size]
-        segment_ids = batch["segment_ids"]
-        attention_mask = make_segment_mask(
-            source_segments=segment_ids,
-            target_segments=segment_ids,
-            add_causal_lm_mask=True,
+
+        responses = generate_for_policy(
+            model,
+            tokenizer,
+            input_ids=batch["input_ids"],
+            pad_mask=batch["attention_mask"],
+            segment_ids=batch["segment_ids"],
+            policy=policy,
+            generation_token_ids=generation_token_ids,
+            stop_token_ids=stop_token_ids,
+            max_new_tokens=200,
+            modular_q_pos=args.modular_q_pos,
         )
-        attention_mask_4d = attention_mask.unsqueeze(1)
-        input_ids = batch["input_ids"]
-        attention_mask_for_pad = batch["attention_mask"]
-
-        with torch.no_grad():
-            input_ids = move_to_target_device(input_ids, device)
-            attention_mask_4d = move_to_target_device(attention_mask_4d, device)
-            attention_mask_for_pad = move_to_target_device(attention_mask_for_pad, device)
-
-            if args.attn_type == "blocked":
-                prefilling_outputs = model(input_ids=input_ids, attention_mask=attention_mask_4d)
-            elif args.attn_type == "standard":
-                prefilling_outputs = model(input_ids=input_ids, attention_mask=attention_mask_for_pad)
-            else:
-                raise ValueError()
-            past_key_values = prefilling_outputs.past_key_values
-
-
-            generation_prefix = generation_token_ids.repeat(curr_batch_size, 1)
-            generation_input_ids = torch.cat([input_ids, generation_prefix], axis=1)
-            attention_mask_for_pad = torch.cat([attention_mask_for_pad, torch.ones_like(generation_prefix)], axis=1)
-            outputs = model.generate(
-                input_ids=generation_input_ids,
-                attention_mask=attention_mask_for_pad,
-                use_cache=True,
-                generation_config=generation_cfg,
-                past_key_values=past_key_values,
-                tokenizer=tokenizer,
-            )
-        generated_seqs = [tokenizer.decode(
-                outputs[i, input_ids.size(1):].tolist(),
-            )
-            for i in range(input_ids.size(0))
-        ]
-
-        responses = [
-            generated_seq.split("<|start_header_id|>assistant<|end_header_id|>")[-1].strip().split("<|eot_id|>")[0]
-            for generated_seq in generated_seqs
-        ]
         for idx, x in enumerate(responses):
             print(x)
             print("Ground-truth: ", batch_answers[idx])
             print("------\n")
 
-        scores = [best_subspan_em(responses[idx], batch_answers[idx]) for idx in range(curr_batch_size)]
-        for idx, score in enumerate(scores):
-            correct_num = correct_num + int(score)
+        scored = [score_sample(responses[idx], batch_answers[idx]) for idx in range(curr_batch_size)]
+        for idx, s in enumerate(scored):
+            correct_num = correct_num + int(s["substring"])
+            em_sum = em_sum + s["em"]
+            f1_sum = f1_sum + s["f1"]
             res_list.append(
                 {
                     # "question": question,
                     "response": responses[idx],
                     "gold_answer": batch_answers[idx],
-                    "score": scores[idx],
+                    "score": s["substring"],
+                    "em": s["em"],
+                    "f1": s["f1"],
                 }
             )
         print("Correct progress", correct_num)
         prog_bar.update(1)
 
     accuracy = correct_num / total_num
-    print(accuracy)
+    em = em_sum / total_num
+    f1 = f1_sum / total_num
+    print(f"substring-acc={accuracy}  em={em}  f1={f1}")
 
     current_time = datetime.datetime.now()
     time_str = current_time.strftime("%Y%m%d-%H%M%S")
@@ -376,8 +330,11 @@ def main():
     # Deterministic, ablation-unique stem: distinct experiments never overwrite
     # each other, and sweep_ablation.py skips a job whose .jsonl already exists.
     # accuracy/timestamp live in the sidecar .summary.json, not the filename.
-    stem = f"NQ_{model_slug}_{state}_attn-{args.attn_type}_re{reencode_num}"
-    file_name = f"result/{stem}.jsonl"
+    # Keep in sync with sweep_ablation.result_stem().
+    qpos = f"-{args.modular_q_pos}" if policy in POLICIES_WITH_MODULAR_Q_POS else ""
+    ppx = "" if args.prompt_preset == "kvlink" else f"_p-{args.prompt_preset}"
+    stem = f"NQ_{model_slug}_{state}_kv-{policy}{qpos}{ppx}_re{reencode_num}"
+    file_name = f"result/ablation/{stem}.jsonl"
     os.makedirs(os.path.dirname(file_name), exist_ok=True)
 
     with open(file_name, "w", encoding="utf-8") as f:
@@ -386,14 +343,16 @@ def main():
 
     summary = {
         "stem": stem, "benchmark": "NQ", "model": model_name,
-        "state": state, "attn_type": args.attn_type,
-        "reencode_num": reencode_num, "accuracy": accuracy,
+        "state": state, "kv_policy": policy, "modular_q_pos": args.modular_q_pos,
+        "prompt_preset": args.prompt_preset,
+        "reencode_num": reencode_num,
+        "accuracy": accuracy, "em": em, "f1": f1,
         "num_examples": total_num, "timestamp": time_str,
     }
-    with open(f"result/{stem}.summary.json", "w", encoding="utf-8") as f:
+    with open(f"result/ablation/{stem}.summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
-    print(f"Dumped at {file_name}  (acc={accuracy})")
+    print(f"Dumped at {file_name}  (acc={accuracy} em={em} f1={f1})")
 
 if __name__ == "__main__":
     main()
