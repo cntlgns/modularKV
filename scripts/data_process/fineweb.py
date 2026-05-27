@@ -55,7 +55,7 @@ def main(argv):
         examples["num_tokens"] = [len(x) for x in token_counts]
         return examples
 
-    dataset_with_token_num = last_half_samples.map(tokenize_texts, batched=True, num_proc=192)
+    dataset_with_token_num = last_half_samples.map(tokenize_texts, batched=True, num_proc=16)
 
     # def filter_fn(example: Dict[str, Any]):
     #     return example["num_tokens"] > FLAGS.min_length_for_memory
@@ -63,7 +63,7 @@ def main(argv):
     def filter_fn(examples: Dict[str, List[Any]]):
         token_counts = examples["num_tokens"]
         return [x > FLAGS.min_length_for_memory for x in token_counts]
-    filtered_dataset = dataset_with_token_num.filter(filter_fn, batched=True, num_proc=192)
+    filtered_dataset = dataset_with_token_num.filter(filter_fn, batched=True, num_proc=16)
     filtered_dataset = filtered_dataset.remove_columns("num_tokens")
 
     text_mem = filtered_dataset.select(range(0, len(filtered_dataset) // 2))
@@ -80,9 +80,9 @@ def main(argv):
     # print("text:", len(text), "textmem:", len(text_mem), "text:", len(text_inst),)
     print("text:", text, "textmem:", text_mem, "text inst:", text_inst,)
     shards = {'train': 128, 'test': 4}
-    text.save_to_disk("dataset_cache/processed/fineweb/text", num_shards=shards, num_proc=128)
-    text_mem.save_to_disk("dataset_cache/processed/fineweb/text_mem", num_shards=shards, num_proc=128)
-    text_inst.save_to_disk("dataset_cache/processed/fineweb/text_inst", num_shards=shards, num_proc=128)
+    text.save_to_disk("dataset_cache/processed/fineweb/text", num_shards=shards, num_proc=16)
+    text_mem.save_to_disk("dataset_cache/processed/fineweb/text_mem", num_shards=shards, num_proc=16)
+    text_inst.save_to_disk("dataset_cache/processed/fineweb/text_inst", num_shards=shards, num_proc=16)
 
 if __name__ == "__main__":
     set_args()

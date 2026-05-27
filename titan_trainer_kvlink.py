@@ -118,6 +118,18 @@ CONFIG_DICT = {
         activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
     ),
 
+    "data_original_step6k_bsz64_link_0_full_ckpt": TitanTrainerConfig(
+        model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
+        tokenizer_path="data/titan_tokenizer/original/tokenizer.model",
+        dataset_version="original",
+        seq_len=4096,
+        reencode_num=0,
+        job_dump_folder="run_logs/data_original_step6k_bsz64_link_0_full_ckpt",
+        ckpt_config=COMMON_CHECKPOINT_CONFIG,
+        training_recipe=bsz64_lr56_steps6k,
+        activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
+    ),
+
     "data_nosum_step6k_bsz64_link_5_full_ckpt": TitanTrainerConfig(
         model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
         tokenizer_path="data/titan_tokenizer/original/tokenizer.model",
@@ -310,12 +322,10 @@ def main(config_name: str, use_wandb_for_log: bool = False):
     with torch.no_grad():
         ckpt_path = PRETRAINED_MODEL_CKPT_PATH_MAPS[task_config.model_name_or_path]
         state_dict = load_checkpoint(ckpt_path=ckpt_path, model_name=task_config.model_name_or_path)
-        is_rank_0 = torch.distributed.get_rank() == 0
         training.load_from_full_model_state_dict(
             model=model,
             full_sd=state_dict,
             device=device_type,
-            is_rank_zero=is_rank_0,
             strict=True,
         )
 
@@ -372,12 +382,14 @@ def main(config_name: str, use_wandb_for_log: bool = False):
     else:
         enable_wandb = False
         enable_tensorboard = True
+    model_short = task_config.model_name_or_path.split("/")[-1]
     metric_logger = build_metric_logger(
         parallel_dims,
         dump_folder=job_dump_folder,
         enable_tensorboard=enable_tensorboard,
         enable_wandb=enable_wandb,
-        wandb_name=config_name,
+        wandb_name=f"{model_short}_{config_name}",
+        wandb_project=f"KVLink{task_config.reencode_num}",
     )
 
     # plot losses loaded from checkpoint (if any) to TensorBoard

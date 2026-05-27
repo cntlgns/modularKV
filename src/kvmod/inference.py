@@ -190,9 +190,44 @@ def generate_for_policy(
         pad_id = tokenizer.eos_token_id
     stop_ids = set(int(x) for x in stop_token_ids)
 
+    # `recover_attn_score`: same mask/position as `recover_pos_enc`, plus a
+    # per-(layer, head, qi) attention-row rescale driven by a trained
+    # regressor (see src/kvmod/attn_rescale.py). The patched LlamaAttention
+    # forward is a no-op when the rescale context is unset.
+    rescale_active = (policy == "recover_attn_score")
+    if rescale_active:
+        from .attn_rescale import (
+            _ensure_rescale_ready, _build_and_set_context_for_batch,
+            set_rescale_context,
+        )
+        _ensure_rescale_ready(model)
+        effective_policy = "recover_pos_enc"
+    else:
+        # Make sure any leftover ctx from a prior call is cleared.
+        try:
+            from .attn_rescale import set_rescale_context
+            set_rescale_context(None)
+        except Exception:
+            pass
+        effective_policy = policy
+
     pf: PolicyPrefill = build_policy_prefill(
-        segment_ids, policy, modular_q_pos=modular_q_pos, dtype=model.dtype
+        segment_ids, effective_policy, modular_q_pos=modular_q_pos, dtype=model.dtype
     )
+
+    if rescale_active:
+        # Build per-row rescale context; for B>1, prediction is per-row so we
+        # serialize. The existing sweep uses B=1 so this is the common path.
+        if B != 1:
+            raise NotImplementedError(
+                "recover_attn_score currently requires batch_size=1; got B=%d" % B
+            )
+        _build_and_set_context_for_batch(
+            model, segment_ids[0].tolist(),
+            n_layers=model.config.num_hidden_layers,
+            n_heads=model.config.num_attention_heads,
+            device=device,
+        )
 
     if not pf.relocalize:
         # ---- single batched prefill -------------------------------------- #
@@ -222,6 +257,11 @@ def generate_for_policy(
                     disable_doc_k_relocalization,
                 )
             )
+
+    # Clear rescale context (no-op if not used).
+    if rescale_active:
+        from .attn_rescale import set_rescale_context
+        set_rescale_context(None)
 
     decoded = [tokenizer.decode(s) for s in seqs]
     return [

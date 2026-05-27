@@ -56,10 +56,10 @@ def main(argv):
 
         return True
 
-    xsum = dataset.filter(xsum_filter, num_proc=96)
+    xsum = dataset.filter(xsum_filter, num_proc=16)
     xsum = xsum.train_test_split(test_size=FLAGS.validation_size)
 
-    xsum.save_to_disk("dataset_cache/processed/xsum/xsum", num_shards=shards, num_proc=128)
+    xsum.save_to_disk("dataset_cache/processed/xsum/xsum", num_shards=shards, num_proc=16)
     print("XSum:", xsum)
 
 if __name__ == "__main__":

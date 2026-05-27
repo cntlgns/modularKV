@@ -27,18 +27,23 @@ KV_CACHE_POLICIES = (
     "modular",
     "recover_cross_attn",
     "recover_cross_attn_oracle_pos",
+    "recover_attn_score",
 )
 
 # Doc band isolated (no cross-doc, no prefix attention) -> use the 4-D
 # segment mask. recover_pos_enc / modular isolate the doc band;
 # recover_pos_enc is the legacy ``blocked``. baseline / recover_cross_attn /
-# oracle use plain causal attention (the 2-D pad mask).
+# oracle use plain causal attention (the 2-D pad mask). recover_attn_score
+# inherits recover_pos_enc's mask + position scheme and adds a post-softmax
+# question-row rescale driven by a trained regressor (see
+# src/kvmod/attn_rescale.py).
 _USE_SEGMENT_MASK = {
     "baseline": False,
     "recover_pos_enc": True,
     "modular": True,
     "recover_cross_attn": False,
     "recover_cross_attn_oracle_pos": False,
+    "recover_attn_score": True,
 }
 
 # Doc positions during prefill: "contiguous" (global 0..T-1) or
@@ -49,6 +54,7 @@ _DOC_POS_SCHEME = {
     "modular": "reset_to_zero",
     "recover_cross_attn": "reset_to_zero",
     "recover_cross_attn_oracle_pos": "contiguous",
+    "recover_attn_score": "contiguous",
 }
 
 # Post-prefill rotation of cached doc K to per-doc local RoPE positions.

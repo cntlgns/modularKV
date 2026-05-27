@@ -81,7 +81,7 @@ def build_hf_eval_data_loader(
             preprocessor=preprocessor,
             training=False,
         )
-        ds = ds.map(preprocess_fn, num_proc=32,remove_columns=columns_to_remove,batched=False)
+        ds = ds.map(preprocess_fn, num_proc=32, remove_columns=columns_to_remove, batched=False, load_from_cache_file=False)
 
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=False)
         valid_loader = DataLoader(

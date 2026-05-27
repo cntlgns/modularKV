@@ -14,13 +14,11 @@ import pandas as pd
 import torch
 from tqdm import tqdm
 from dotenv import load_dotenv
-from openai import AzureOpenAI
+from openai import OpenAI
 from transformers import AutoModel, AutoTokenizer, PreTrainedModel, PreTrainedTokenizer
 
 load_dotenv()
 api_key = os.getenv('api_key')
-api_version = os.getenv('api_version')
-azure_endpoint = os.getenv('azure_endpoint')
 
 @torch.no_grad()
 def compute_embeddings(sentences: List[str], model: PreTrainedModel, tokenizer: PreTrainedTokenizer):
@@ -57,9 +55,12 @@ def process_tqa_instance(ins: Dict[str, Any], model:PreTrainedModel, retrieval_t
         "documents":documents[:10]
     }
 
-def process_tqa(input_file: str, model:PreTrainedModel, retrieval_tokenizer:PreTrainedTokenizer):
+def process_tqa(input_file: str, model:PreTrainedModel, retrieval_tokenizer:PreTrainedTokenizer, num_samples: int = None):
     with open(input_file, "r", encoding="utf-8") as f:
         tqa_instances: List[Dict[str, Any]] = json.load(f)
+
+    if num_samples is not None and num_samples < len(tqa_instances):
+        tqa_instances = random.sample(population=tqa_instances, k=num_samples)
 
     dataset = []
     for i in tqdm(range(0, len(tqa_instances)), desc="Process TQA: ", total=len(tqa_instances)):
@@ -92,9 +93,12 @@ def process_2wiki_instance(ins: Dict[str, Any], model:PreTrainedModel, retrieval
         "documents":documents[:10]
     }
 
-def process_2wiki(input_file: str, model:PreTrainedModel, retrieval_tokenizer:PreTrainedTokenizer):
+def process_2wiki(input_file: str, model:PreTrainedModel, retrieval_tokenizer:PreTrainedTokenizer, num_samples: int = None):
     df = pd.read_parquet(path=input_file)
     wiki_instances = df.to_dict(orient="records")
+
+    if num_samples is not None and num_samples < len(wiki_instances):
+        wiki_instances = random.sample(population=wiki_instances, k=num_samples)
 
     dataset = []
     for i in tqdm(range(0, len(wiki_instances)), desc="Process 2wiki: ", total=len(wiki_instances)):
@@ -104,23 +108,19 @@ def process_2wiki(input_file: str, model:PreTrainedModel, retrieval_tokenizer:Pr
     return dataset
 
 def completion_with_backoff_mcopenai(**kwargs):
-    client = AzureOpenAI(
-        # https://learn.microsoft.com/en-us/azure/ai-services/openai/reference#rest-api-versioning
-        api_version=api_version,
-        # https://learn.microsoft.com/en-us/azure/cognitive-services/openai/how-to/create-resource?pivots=web-portal#create-a-resource
-        azure_endpoint=azure_endpoint,
-        api_key=api_key,
-    )
+    client = OpenAI(api_key=api_key)
     result = client.chat.completions.create(
         model="gpt-4o-mini",
         **kwargs,
     )
     return result
 
-def generate_answer(dataset: List):
+def generate_answer(dataset: List, save_path: str = None, save_every: int = 500):
 
     system_msg = "You are an intelligent AI assistant. Please answer questions based on the user's instructions. Below are some reference documents that may help you in answering the user's question.\n\n"
     for i in tqdm(range(0, len(dataset)), desc="Generating answer: ", total=len(dataset)):
+        if dataset[i].get("generated"):
+            continue
         user_msg = ""
         data = dataset[i]
         for j in range(len(data["documents"])):
@@ -132,6 +132,11 @@ def generate_answer(dataset: List):
 
         dataset[i]["generated"] = response
 
+        if save_path and (i + 1) % save_every == 0:
+            write_jsonline(save_path, dataset)
+
+    if save_path:
+        write_jsonline(save_path, dataset)
     return dataset
 
 
@@ -150,19 +155,32 @@ if __name__ == '__main__':
     random.seed(42)
     tqa_path = "FiD/open_domain_data/TQA/train.json"
     wiki_path = "data/raw/2wikimultihop/train.parquet"
-    model_name = "facebook/contriever-msmarco"
-    retrieval_tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_name)
-    model: PreTrainedModel = AutoModel.from_pretrained(
-        pretrained_model_name_or_path=model_name,
-        torch_dtype=torch.bfloat16,
-        device_map="cuda:0"
-    )
-    tqa_data = process_tqa(tqa_path, model, retrieval_tokenizer)
-    wiki_data = process_2wiki(wiki_path, model, retrieval_tokenizer)
-    num_samples = 20000
-    tqa_data = random.sample(population=tqa_data, k=num_samples)
-    wiki_data = random.sample(population=wiki_data, k=num_samples)
-    merged_data = tqa_data + wiki_data
-    random.shuffle(merged_data)
-    generate_answer(merged_data)
-    write_jsonline("data/raw/block_qa/block_qa.jsonl",merged_data)
+    out_path = "data/raw/block_qa/block_qa.jsonl"
+    retrieved_path = "data/raw/block_qa/block_qa.retrieved.jsonl"
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    if os.path.exists(out_path):
+        # Resume from partial save (rows already have `generated` filled in)
+        print(f"Resuming from {out_path}")
+        merged_data = load_jsonline(out_path)
+    elif os.path.exists(retrieved_path):
+        # Retrieval was done but generation didn't start (or wasn't checkpointed)
+        print(f"Loading retrieved data from {retrieved_path}")
+        merged_data = load_jsonline(retrieved_path)
+    else:
+        model_name = "facebook/contriever-msmarco"
+        retrieval_tokenizer: PreTrainedTokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path=model_name)
+        model: PreTrainedModel = AutoModel.from_pretrained(
+            pretrained_model_name_or_path=model_name,
+            torch_dtype=torch.bfloat16,
+            device_map="cuda:0"
+        )
+        num_samples = 20000
+        tqa_data = process_tqa(tqa_path, model, retrieval_tokenizer, num_samples=num_samples)
+        wiki_data = process_2wiki(wiki_path, model, retrieval_tokenizer, num_samples=num_samples)
+        merged_data = tqa_data + wiki_data
+        random.shuffle(merged_data)
+        write_jsonline(retrieved_path, merged_data)
+
+    generate_answer(merged_data, save_path=out_path, save_every=500)
+    write_jsonline(out_path, merged_data)

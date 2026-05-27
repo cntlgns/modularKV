@@ -64,10 +64,10 @@ def main(argv):
 
         return True
 
-    qa = first_half.filter(qa_filter, num_proc=96)
+    qa = first_half.filter(qa_filter, num_proc=16)
     qa = qa.train_test_split(test_size=FLAGS.validation_size)
 
-    qa.save_to_disk("dataset_cache/processed/block_qa/qa", num_shards=shards, num_proc=128)
+    qa.save_to_disk("dataset_cache/processed/block_qa/qa", num_shards=shards, num_proc=16)
     print("qa:", qa)
 
     def qamem_filter(sample):
@@ -96,10 +96,10 @@ def main(argv):
 
         return True
 
-    qamem = second_half.filter(qamem_filter, num_proc=96)
+    qamem = second_half.filter(qamem_filter, num_proc=16)
     qamem = qamem.train_test_split(test_size=FLAGS.validation_size)
 
-    qamem.save_to_disk("dataset_cache/processed/block_qa/qamem", num_shards=shards, num_proc=128)
+    qamem.save_to_disk("dataset_cache/processed/block_qa/qa_mem", num_shards=shards, num_proc=16)
     print("qamem:", qamem)
 
 if __name__ == "__main__":
