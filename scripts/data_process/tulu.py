@@ -98,10 +98,10 @@ def main(argv):
         else:
             return True
 
-    sft = dataset.filter(sft_filter, num_proc=96)
+    sft = dataset.filter(sft_filter, num_proc=16)
     sft = sft.train_test_split(test_size=FLAGS.validation_size)
 
-    sft.save_to_disk("dataset_cache/processed/tulu/sft", num_shards=shards, num_proc=128)
+    sft.save_to_disk("dataset_cache/processed/tulu/sft", num_shards=shards, num_proc=16)
     print("sft:", sft)
 
 

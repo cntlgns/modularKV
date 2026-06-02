@@ -197,7 +197,7 @@ class SumAttentionPreprocessor():
                 self.tokenizer(x, add_special_tokens=False)["input_ids"] for x in input_texts
             ]
         sft_system_input_ids = random.choice(self.sft_system_input_id_list)
-        input_ids = sft_system_input_ids
+        input_ids = list(sft_system_input_ids)
         labels = [-100] * len(sft_system_input_ids)
         for i in range(len(conversation)):
             if conversation[i]["from"] == "User":
@@ -423,7 +423,7 @@ class SumAttentionPreprocessor():
         example: Dict[str, str],
     ):
         qa_system_input_ids = random.choice(self.qa_system_input_id_list)
-        system_input_ids = qa_system_input_ids
+        system_input_ids = list(qa_system_input_ids)
         input_ids = system_input_ids
 
         for j in range(self.qa_document_num):
@@ -476,7 +476,7 @@ class SumAttentionPreprocessor():
             ]
 
         tulu_system_input_ids = random.choice(self.sft_system_input_id_list)
-        input_ids = tulu_system_input_ids
+        input_ids = list(tulu_system_input_ids)
         labels = [-100] * len(input_ids)
 
         for i in range(len(conversation)):
@@ -556,14 +556,17 @@ class BlockAttnCollator():
         input_ids = []
         labels = []
         segment_ids = []
-        length_list = [len(x['input_ids']) for x in features]
-        max_length = max(length_list)
+        max_length = max(len(x['input_ids']) for x in features)
         for idx in range(len(features)):
-            seq_length = len(features[idx]['input_ids'])
-            residual = max_length - seq_length
-            input_ids.append(features[idx]['input_ids'] + [self.pad_token_idx] * residual)
-            labels.append(features[idx]['labels'] + [-100] * residual)
-            segment_ids.append(features[idx]["segment_ids"] + [-1] * residual)
+            ii = features[idx]['input_ids']
+            la = features[idx]['labels']
+            sg = features[idx]["segment_ids"]
+            # Pad each field independently to max_length. Defensive: if a producer
+            # returned a feature with mismatched len(labels)!=len(input_ids), still
+            # produces rectangular tensors so the batch survives.
+            input_ids.append(list(ii) + [self.pad_token_idx] * (max_length - len(ii)))
+            labels.append(list(la) + [-100] * (max_length - len(la)))
+            segment_ids.append(list(sg) + [-1] * (max_length - len(sg)))
 
         input_ids = torch.LongTensor(input_ids)
         labels = torch.LongTensor(labels)

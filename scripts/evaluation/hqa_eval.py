@@ -93,6 +93,18 @@ parser.add_argument(
     action="store_true",
     help="Feed only the gold (supporting) documents instead of all distractor documents.",
 )
+parser.add_argument(
+    "--max_examples",
+    type=int,
+    default=None,
+    help="If set, evaluate on at most this many examples (clamped to len(dataset)).",
+)
+parser.add_argument(
+    "--out_dir",
+    type=str,
+    default="result/ablation",
+    help="Output directory for the .jsonl + .summary.json (relative to project root).",
+)
 
 args = parser.parse_args()
 
@@ -233,8 +245,9 @@ def main():
         ),
     )
 
-    total_num = len(dataset)
+    total_num = min(args.max_examples, len(dataset)) if args.max_examples else len(dataset)
     dataset = dataset.select(np.arange(total_num))
+    all_answers = all_answers[:total_num]
     correct_num = 0
     em_sum = 0.0
     f1_sum = 0.0
@@ -315,8 +328,9 @@ def main():
     qpos = f"-{args.modular_q_pos}" if policy in POLICIES_WITH_MODULAR_Q_POS else ""
     ppx = "" if args.prompt_preset == "kvlink" else f"_p-{args.prompt_preset}"
     stem = f"hqa_{model_slug}_{state}_kv-{policy}{qpos}{ppx}_re{reencode_num}"
-    file_name = f"result/ablation/{stem}.jsonl"
-    os.makedirs(os.path.dirname(file_name), exist_ok=True)
+    out_dir = args.out_dir
+    file_name = f"{out_dir}/{stem}.jsonl"
+    os.makedirs(out_dir, exist_ok=True)
 
     with open(file_name, "w", encoding="utf-8") as f:
         for entry in res_list:
@@ -330,7 +344,7 @@ def main():
         "accuracy": accuracy, "em": em, "f1": f1,
         "num_examples": total_num, "timestamp": time_str,
     }
-    with open(f"result/ablation/{stem}.summary.json", "w", encoding="utf-8") as f:
+    with open(f"{out_dir}/{stem}.summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
     print(f"Dumped at {file_name}  (acc={accuracy} em={em} f1={f1})")

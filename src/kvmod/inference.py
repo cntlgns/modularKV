@@ -102,19 +102,33 @@ def _greedy_decode(
     pad_id: int,
     stop_ids: set[int],
     max_new_tokens: int,
+    track_gen_decode: bool = False,
 ) -> list[list[int]]:
     """Forward ``genprefix`` against ``cache`` then greedy-argmax until every
     row hits a stop id (or ``max_new_tokens``). Returns generated ids per row,
     *including* the genprefix tokens (caller decodes + splits, mirroring the
-    original ``outputs[i, input_ids.size(1):]`` slice)."""
+    original ``outputs[i, input_ids.size(1):]`` slice).
+
+    When ``track_gen_decode`` is set, the module-level decode rescale step is
+    advanced before each forward so the patched attention applies the gen-row
+    rescale to the right gi (genprefix rows are gi=0..G-1, then gi=G, G+1, ...).
+    """
     device = next(model.parameters()).device
     B, G = genprefix.shape
+
+    if track_gen_decode:
+        from .attn_rescale import set_decode_start_gi
+    else:
+        set_decode_start_gi = None
+
     arangeG = torch.arange(G, device=device)
     pos = start_position.to(device).unsqueeze(1) + arangeG  # (B, G)
     attn = torch.cat(
         [decode_pad_mask.to(device), torch.ones((B, G), device=device, dtype=decode_pad_mask.dtype)],
         dim=1,
     )
+    if set_decode_start_gi is not None:
+        set_decode_start_gi(0)  # genprefix rows occupy gi 0..G-1
     out = model(
         input_ids=genprefix.to(device),
         attention_mask=attn,
@@ -125,6 +139,7 @@ def _greedy_decode(
     cache = out.past_key_values
     next_tok = out.logits[:, -1, :].argmax(dim=-1)  # (B,)
     cur_pos = pos[:, -1] + 1
+    cur_gi = G  # next generated token's gi
 
     seqs: list[list[int]] = [genprefix[b].tolist() for b in range(B)]
     done = torch.zeros(B, dtype=torch.bool, device=device)
@@ -140,6 +155,8 @@ def _greedy_decode(
             break
         feed = torch.where(done, torch.full_like(next_tok, pad_id), next_tok)
         attn = torch.cat([attn, torch.ones((B, 1), device=device, dtype=attn.dtype)], dim=1)
+        if set_decode_start_gi is not None:
+            set_decode_start_gi(cur_gi)
         out = model(
             input_ids=feed.unsqueeze(1),
             attention_mask=attn,
@@ -150,6 +167,7 @@ def _greedy_decode(
         cache = out.past_key_values
         next_tok = out.logits[:, -1, :].argmax(dim=-1)
         cur_pos = cur_pos + 1
+        cur_gi += 1
     return seqs
 
 
@@ -190,9 +208,104 @@ def generate_for_policy(
         pad_id = tokenizer.eos_token_id
     stop_ids = set(int(x) for x in stop_token_ids)
 
+    # `recover_attn_score`: same mask/position as `recover_pos_enc`, plus a
+    # per-(layer, head, qi) attention-row rescale driven by a trained
+    # regressor (see src/kvmod/attn_rescale.py). The patched LlamaAttention
+    # forward is a no-op when the rescale context is unset.
+    rescale_active = (policy == "recover_attn_score")
+    # `recover_attn_score_gen`: recover_pos_enc mask/position, plus a 5-region
+    # rescale of each GENERATION (decode) row driven by the gen-token GBMs. The
+    # question span is a distinct region. prefill question rows are NOT rescaled
+    # here (decode-only correction). See src/kvmod/attn_rescale.py.
+    rescale_gen_active = (policy == "recover_attn_score_gen")
+    # clean question-only (prefill) rescale, and combined (prefill question +
+    # decode gen) rescale — both use the block_qa-trained GBMs.
+    rescale_q_active  = (policy == "recover_attn_score_q")
+    rescale_qg_active = (policy == "recover_attn_score_qg")
+    if rescale_active:
+        from .attn_rescale import (
+            _ensure_rescale_ready, _build_and_set_context_for_batch,
+            set_rescale_context,
+        )
+        _ensure_rescale_ready(model)
+        effective_policy = "recover_pos_enc"
+    elif rescale_gen_active:
+        from .attn_rescale import (
+            _ensure_gen_rescale_ready, build_gen_decode_context,
+            set_decode_context, set_rescale_context,
+        )
+        _ensure_gen_rescale_ready(model)
+        set_rescale_context(None)  # no prefill question rescale in decode-only mode
+        effective_policy = "recover_pos_enc"
+        if B != 1:
+            raise NotImplementedError(
+                "recover_attn_score_gen currently requires batch_size=1; got B=%d" % B
+            )
+    elif rescale_q_active or rescale_qg_active:
+        from .attn_rescale import (
+            _ensure_q_rescale_ready, _build_and_set_q_context_for_batch,
+            set_rescale_context, set_decode_context,
+        )
+        _ensure_q_rescale_ready(model)
+        if rescale_qg_active:
+            from .attn_rescale import _ensure_gen_rescale_ready, build_gen_decode_context
+            _ensure_gen_rescale_ready(model)
+        set_decode_context(None)
+        effective_policy = "recover_pos_enc"
+        if B != 1:
+            raise NotImplementedError(
+                "%s currently requires batch_size=1; got B=%d" % (policy, B)
+            )
+    else:
+        # Make sure any leftover ctx from a prior call is cleared.
+        try:
+            from .attn_rescale import set_rescale_context, set_decode_context
+            set_rescale_context(None)
+            set_decode_context(None)
+        except Exception:
+            pass
+        effective_policy = policy
+
     pf: PolicyPrefill = build_policy_prefill(
-        segment_ids, policy, modular_q_pos=modular_q_pos, dtype=model.dtype
+        segment_ids, effective_policy, modular_q_pos=modular_q_pos, dtype=model.dtype
     )
+
+    if rescale_active:
+        # Build per-row rescale context; for B>1, prediction is per-row so we
+        # serialize. The existing sweep uses B=1 so this is the common path.
+        if B != 1:
+            raise NotImplementedError(
+                "recover_attn_score currently requires batch_size=1; got B=%d" % B
+            )
+        _build_and_set_context_for_batch(
+            model, segment_ids[0].tolist(),
+            n_layers=model.config.num_hidden_layers,
+            n_heads=model.config.num_attention_heads,
+            device=device,
+        )
+
+    if rescale_q_active or rescale_qg_active:
+        # Prefill question rescale with the clean block_qa question GBM.
+        from .attn_rescale import _build_and_set_q_context_for_batch
+        _build_and_set_q_context_for_batch(
+            model, segment_ids[0].tolist(),
+            n_layers=model.config.num_hidden_layers,
+            n_heads=model.config.num_attention_heads,
+            device=device,
+        )
+
+    if rescale_gen_active or rescale_qg_active:
+        # Amortized: predict the whole (gi, layer, head) target grid once. The
+        # context is built here but only ACTIVATED after prefill (below), so the
+        # decode rescale never touches prefill rows (sys/docs/question).
+        from .attn_rescale import build_gen_decode_context
+        dctx = build_gen_decode_context(
+            model, segment_ids[0].tolist(),
+            n_layers=model.config.num_hidden_layers,
+            n_heads=model.config.num_attention_heads,
+            max_gi=G + max_new_tokens + 1,
+            device=device,
+        )
 
     if not pf.relocalize:
         # ---- single batched prefill -------------------------------------- #
@@ -200,6 +313,12 @@ def generate_for_policy(
             prefill_mask = pf.attention_mask_4d.to(device=device, dtype=model.dtype)
         else:
             prefill_mask = pad_mask
+        # Decode context MUST be unset during prefill (the patched forward would
+        # otherwise apply the gen-row rescale to prompt rows). The prefill
+        # question rescale (_CTX, recover_attn_score / _qg) is separately gated
+        # by q_hi > T_q inside _apply_rescale and is safe to leave set.
+        from .attn_rescale import set_decode_context as _set_dctx
+        _set_dctx(None)
         out = model(
             input_ids=input_ids,
             attention_mask=prefill_mask,
@@ -207,9 +326,13 @@ def generate_for_policy(
             past_key_values=DynamicCache(),
             use_cache=True,
         )
+        decode_rescale = rescale_gen_active or rescale_qg_active
+        if decode_rescale:
+            _set_dctx(dctx)  # activate only for the decode loop
         seqs = _greedy_decode(
             model, out.past_key_values, genprefix, pad_mask,
             pf.next_position, pad_id, stop_ids, max_new_tokens,
+            track_gen_decode=decode_rescale,
         )
     else:
         # ---- recover_cross_attn_oracle_pos: row-by-row two-stage --------- #
@@ -222,6 +345,14 @@ def generate_for_policy(
                     disable_doc_k_relocalization,
                 )
             )
+
+    # Clear rescale contexts (no-op if not used).
+    if rescale_active or rescale_q_active or rescale_qg_active:
+        from .attn_rescale import set_rescale_context
+        set_rescale_context(None)
+    if rescale_gen_active or rescale_qg_active:
+        from .attn_rescale import set_decode_context
+        set_decode_context(None)
 
     decoded = [tokenizer.decode(s) for s in seqs]
     return [

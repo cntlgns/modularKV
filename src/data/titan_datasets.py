@@ -70,7 +70,7 @@ def load_data_and_process_fn(
             preprocessor_fn = preprocessor.process_qamem
         else:
             raise NotImplementedError()
-        remove_columns=['prompt', 'question', 'answers', 'generated', 'inputs', 'documents']
+        remove_columns=['question', 'answers', 'generated', 'documents']
         num_shards = 32
     elif data_component_name in ["xsum"]:
         data_path = f"dataset_cache/processed/xsum/{data_component_name}"

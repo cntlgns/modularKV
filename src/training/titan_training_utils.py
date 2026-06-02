@@ -58,6 +58,14 @@ COMMON_CHECKPOINT_CONFIG = CheckpointConfig(
     load_step=-1,
 )
 
+# 8B checkpoints are ~16GB each; save weights-only every 2k steps to keep disk
+# usage bounded. No resume capability — purely for downstream eval.
+WEIGHTS_ONLY_2K_CKPT_CONFIG = replace(
+    COMMON_CHECKPOINT_CONFIG,
+    interval=2000,
+    model_weights_only=True,
+)
+
 DEFUALT_TRAINING_RECIPE = TrainingRecipe(
     batch_size=32,
     lr=5e-6,
@@ -104,4 +112,6 @@ SELECTIVE_ACTIVATION_CHECKPOINT_CONFIG = ActivationCheckpoint(
 
 PRETRAINED_MODEL_CKPT_PATH_MAPS = {
     "meta-llama/Llama-3.2-1B-Instruct": "model_cache/Llama-3.2-1B-Instruct/model.safetensors",
+    # Directory holding sharded model-0000{1..4}-of-00004.safetensors; loader globs them.
+    "meta-llama/Llama-3.1-8B-Instruct": "model_cache/Llama-3.1-8B-Instruct",
 }

@@ -54,8 +54,14 @@ import torchtune.training as training
 import tqdm
 from torch.distributed.elastic.multiprocessing.errors import record
 from torch.utils.data import DataLoader
+from torchtune.models.llama3_1 import llama3_1_8b
 from torchtune.models.llama3_2 import llama3_2_1b
 from transformers import AutoTokenizer
+
+MODEL_BUILDER_MAPS = {
+    "meta-llama/Llama-3.2-1B-Instruct": llama3_2_1b,
+    "meta-llama/Llama-3.1-8B-Instruct": llama3_1_8b,
+}
 
 from src.data.titan_data_utils import (
     SumAttentionPreprocessor,
@@ -85,9 +91,11 @@ from src.training.titan_trainer_config_utils import (
 from src.training.titan_training_utils import (
     COMMON_CHECKPOINT_CONFIG,
     DATASET_MAPPING,
+    DEFUALT_TRAINING_RECIPE,
     FULL_ACTIVATION_CHECKPOINT_CONFIG,
     PRETRAINED_MODEL_CKPT_PATH_MAPS,
     SELECTIVE_ACTIVATION_CHECKPOINT_CONFIG,
+    WEIGHTS_ONLY_2K_CKPT_CONFIG,
     bsz64_lr56_steps6k,
     bsz64_lr56_steps600
 )
@@ -113,6 +121,18 @@ CONFIG_DICT = {
         seq_len=4096,
         reencode_num=5,
         job_dump_folder="run_logs/data_original_step6k_bsz64_link_5_full_ckpt",
+        ckpt_config=COMMON_CHECKPOINT_CONFIG,
+        training_recipe=bsz64_lr56_steps6k,
+        activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
+    ),
+
+    "data_original_step6k_bsz64_link_0_full_ckpt": TitanTrainerConfig(
+        model_name_or_path="meta-llama/Llama-3.2-1B-Instruct",
+        tokenizer_path="data/titan_tokenizer/original/tokenizer.model",
+        dataset_version="original",
+        seq_len=4096,
+        reencode_num=0,
+        job_dump_folder="run_logs/data_original_step6k_bsz64_link_0_full_ckpt",
         ckpt_config=COMMON_CHECKPOINT_CONFIG,
         training_recipe=bsz64_lr56_steps6k,
         activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
@@ -152,7 +172,37 @@ CONFIG_DICT = {
         ckpt_config=COMMON_CHECKPOINT_CONFIG,
         training_recipe=bsz64_lr56_steps600,
         activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
-    )
+    ),
+
+    "data_original_step6k_bsz64_link_0_full_ckpt_8b": TitanTrainerConfig(
+        model_name_or_path="meta-llama/Llama-3.1-8B-Instruct",
+        # Llama-3.1 and Llama-3.2 share the same tiktoken 128k vocab + special
+        # tokens (128011/128254/128255 used by KVLink), so we reuse 1B's file.
+        tokenizer_path="data/titan_tokenizer/original/tokenizer.model",
+        dataset_version="original",
+        seq_len=4096,
+        reencode_num=0,
+        job_dump_folder="run_logs/data_original_step6k_bsz64_link_0_full_ckpt_8b",
+        ckpt_config=WEIGHTS_ONLY_2K_CKPT_CONFIG,
+        training_recipe=bsz64_lr56_steps6k,
+        activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
+    ),
+
+    # Throwaway config to probe per-step throughput on a different GPU/count.
+    # Distinct dump folder so it never collides with the real 8B run above.
+    # Uses bsz=32 recipe so 4 GPUs -> local_bsz=8 (matches the a100-8 per-GPU
+    # workload) for an apples-to-apples per-GPU throughput comparison.
+    "data_original_step6k_bsz64_link_0_full_ckpt_8b_probe": TitanTrainerConfig(
+        model_name_or_path="meta-llama/Llama-3.1-8B-Instruct",
+        tokenizer_path="data/titan_tokenizer/original/tokenizer.model",
+        dataset_version="original",
+        seq_len=4096,
+        reencode_num=0,
+        job_dump_folder="run_logs/_probe_8b",
+        ckpt_config=WEIGHTS_ONLY_2K_CKPT_CONFIG,
+        training_recipe=DEFUALT_TRAINING_RECIPE,
+        activation_checkpoint=FULL_ACTIVATION_CHECKPOINT_CONFIG,
+    ),
 }
 
 # Enable debug tracing on failure: https://pytorch.org/docs/stable/elastic/errors.html
@@ -272,8 +322,9 @@ def main(config_name: str, use_wandb_for_log: bool = False):
         )
 
     logger.info(f"Building {model_name}...")
+    model_builder = MODEL_BUILDER_MAPS[model_name]
     with torch.device("meta"):
-        model = llama3_2_1b()
+        model = model_builder()
     # log model size
     model_param_count = utils.get_num_params(model)
     logger.info(
@@ -310,12 +361,10 @@ def main(config_name: str, use_wandb_for_log: bool = False):
     with torch.no_grad():
         ckpt_path = PRETRAINED_MODEL_CKPT_PATH_MAPS[task_config.model_name_or_path]
         state_dict = load_checkpoint(ckpt_path=ckpt_path, model_name=task_config.model_name_or_path)
-        is_rank_0 = torch.distributed.get_rank() == 0
         training.load_from_full_model_state_dict(
             model=model,
             full_sd=state_dict,
             device=device_type,
-            is_rank_zero=is_rank_0,
             strict=True,
         )
 
@@ -372,12 +421,14 @@ def main(config_name: str, use_wandb_for_log: bool = False):
     else:
         enable_wandb = False
         enable_tensorboard = True
+    model_short = task_config.model_name_or_path.split("/")[-1]
     metric_logger = build_metric_logger(
         parallel_dims,
         dump_folder=job_dump_folder,
         enable_tensorboard=enable_tensorboard,
         enable_wandb=enable_wandb,
-        wandb_name=config_name,
+        wandb_name=f"{model_short}_{config_name}",
+        wandb_project=f"KVLink{task_config.reencode_num}",
     )
 
     # plot losses loaded from checkpoint (if any) to TensorBoard

@@ -21,6 +21,10 @@
 #                                                 = short-answer system prompt)
 #   [reencode_num]   number of link tokens        (default: 0)
 #
+# Env vars (optional):
+#   MAX_EXAMPLES     limit examples per benchmark (forwarded as --max_examples)
+#   OUT_DIR          override output directory   (forwarded as --out_dir)
+#
 # Example:
 #   bash scripts/evaluation/run_eval.sh nq meta-llama/Llama-3.2-1B-Instruct gold 0 16
 
@@ -72,6 +76,10 @@ GOLD_FLAG=""
 [ "$MODE" = "gold" ] && GOLD_FLAG="--gold_only"
 POS_FLAG=""
 [ "$BENCH" = "nq" ] && POS_FLAG="--pos $POS"
+MAX_FLAG=""
+[ -n "${MAX_EXAMPLES:-}" ] && MAX_FLAG="--max_examples $MAX_EXAMPLES"
+OUT_FLAG=""
+[ -n "${OUT_DIR:-}" ] && OUT_FLAG="--out_dir $OUT_DIR"
 
 export TOKENIZERS_PARALLELISM=false
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -87,7 +95,7 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader || true
 
 $PYTHON "$SCRIPT" \
     --ckpt_path "$MODEL" \
-    --model_name "$MODEL" \
+    --model_name "${MODEL_NAME:-$MODEL}" \
     --hf True \
     --batch_size "$BATCH_SIZE" \
     --kv_policy "$KV_POLICY" \
@@ -95,6 +103,8 @@ $PYTHON "$SCRIPT" \
     --prompt_preset "$PROMPT_PRESET" \
     --reencode_num "$REENCODE_NUM" \
     $POS_FLAG \
-    $GOLD_FLAG
+    $GOLD_FLAG \
+    $MAX_FLAG \
+    $OUT_FLAG
 
 echo "All done: $BENCH / $MODEL / $MODE"

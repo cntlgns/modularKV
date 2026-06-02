@@ -116,12 +116,14 @@ tests/e2e/toy_examples/deepspeed/synchronous/output.txt
 local_scripts/*
 *cache/*
 result/
-dataset_cache/
+dataset_cache
 training_res/
 launch_script/
 run_logs/
 FiD
-data/raw/2wikimultihop
+data
 slurm/
 .claude
 hf_cache/
+model_cache/
+analysis/
