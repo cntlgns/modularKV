@@ -28,6 +28,9 @@ KV_CACHE_POLICIES = (
     "recover_cross_attn",
     "recover_cross_attn_oracle_pos",
     "recover_attn_score",
+    "recover_attn_score_gen",
+    "recover_attn_score_q",
+    "recover_attn_score_qg",
 )
 
 # Doc band isolated (no cross-doc, no prefix attention) -> use the 4-D
@@ -44,6 +47,9 @@ _USE_SEGMENT_MASK = {
     "recover_cross_attn": False,
     "recover_cross_attn_oracle_pos": False,
     "recover_attn_score": True,
+    "recover_attn_score_gen": True,
+    "recover_attn_score_q": True,
+    "recover_attn_score_qg": True,
 }
 
 # Doc positions during prefill: "contiguous" (global 0..T-1) or
@@ -55,6 +61,9 @@ _DOC_POS_SCHEME = {
     "recover_cross_attn": "reset_to_zero",
     "recover_cross_attn_oracle_pos": "contiguous",
     "recover_attn_score": "contiguous",
+    "recover_attn_score_gen": "contiguous",
+    "recover_attn_score_q": "contiguous",
+    "recover_attn_score_qg": "contiguous",
 }
 
 # Post-prefill rotation of cached doc K to per-doc local RoPE positions.

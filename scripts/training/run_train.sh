@@ -57,10 +57,24 @@ if [ ! -f "data/titan_tokenizer/original/tokenizer.model" ]; then
     echo "      --tokenizer_path original --local_dir data/titan_tokenizer/" >&2
     exit 1
 fi
-if [ ! -f "model_cache/Llama-3.2-1B-Instruct/model.safetensors" ]; then
-    echo "Error: base model missing at model_cache/Llama-3.2-1B-Instruct/model.safetensors" >&2
-    exit 1
-fi
+# Pick the base-model path based on config suffix. 8B is sharded into 4 files;
+# 1B is a single safetensors. Loader (torchtune_model_checkpointer.py) accepts
+# either a file or a directory of safetensors shards.
+case "$CONFIG_NAME" in
+    *_8b)
+        MODEL_DIR="model_cache/Llama-3.1-8B-Instruct"
+        if [ ! -f "$MODEL_DIR/model-00001-of-00004.safetensors" ]; then
+            echo "Error: 8B base weights missing at $MODEL_DIR" >&2
+            exit 1
+        fi
+        ;;
+    *)
+        if [ ! -f "model_cache/Llama-3.2-1B-Instruct/model.safetensors" ]; then
+            echo "Error: base model missing at model_cache/Llama-3.2-1B-Instruct/model.safetensors" >&2
+            exit 1
+        fi
+        ;;
+esac
 
 # Which data components does this config need?
 case "$CONFIG_NAME" in

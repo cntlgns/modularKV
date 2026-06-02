@@ -265,7 +265,11 @@ class CheckpointManager:
             # For now, we will manually pop the freqs_cis buffer, as we made this permanent
             # temporarily and we don't want to include it in the exported state_dict.
             # Context: https://github.com/pytorch/torchtitan/blob/main/torchtitan/models/llama/model.py#L348
-            self.states.pop("freqs_cis")
+            # torchtune's TransformerDecoder doesn't expose freqs_cis as a top-level
+            # state_dict key (it's registered inside attention layers' RoPE module),
+            # so the pop is a no-op for torchtune models. Default to None to avoid
+            # KeyError on the final-step save path.
+            self.states.pop("freqs_cis", None)
 
             if self.export_dtype != torch.float32:
                 self.states = {

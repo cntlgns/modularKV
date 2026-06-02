@@ -52,8 +52,36 @@ class RescaleContext:
     region_idx: torch.Tensor
 
 
-# module-level context (set by user before forward, cleared after)
+@dataclass
+class DecodeRescaleContext:
+    """Predictions + region layout for the DECODE phase of one sample.
+
+    Used to rescale generation-token query rows (1+ rows per decode forward).
+    Region scheme is 5-way (the question span is now a distinct region the gen
+    token attends back to):
+        0=sink  1=sys_excl  2=docs  3=question  4=rest(=genprefix+gen-prev+self)
+    """
+    # (max_gi, n_layers, n_heads, 4) -- t_sink, t_sys(incl sink), t_docs, t_question
+    targets: torch.Tensor
+    prompt_len: int                  # == q_hi; first gen position
+    sys_end: int
+    q_lo: int
+    q_hi: int
+    doc_spans: list                  # list[(ds, de)] within [0, prompt_len)
+    # (prompt_len,) long: region id for the fixed prompt keys. Keys >= prompt_len
+    # are region 4 (rest), filled on demand for the current key length.
+    prompt_region_idx: torch.Tensor
+    # Correction strength in [0, 1]: interpolate per-region between the current
+    # (measured) distribution and the GBM target. 0 = no-op (== recover_pos_enc),
+    # 1 = full correction. Lets us measure the dose-response and avoid the
+    # over-correction that a full per-layer attention rewrite can cause.
+    strength: float = 1.0
+
+
+# module-level contexts (set before forward, cleared after)
 _CTX: Optional[RescaleContext] = None
+_DECODE_CTX: Optional[DecodeRescaleContext] = None
+_DECODE_START_GI: int = 0
 
 
 def set_rescale_context(ctx: Optional[RescaleContext]):
@@ -65,13 +93,39 @@ def get_rescale_context() -> Optional[RescaleContext]:
     return _CTX
 
 
+def set_decode_context(ctx: Optional[DecodeRescaleContext]):
+    global _DECODE_CTX
+    _DECODE_CTX = ctx
+
+
+def set_decode_start_gi(gi: int):
+    """gi of the FIRST query row in the next decode forward. Subsequent rows in
+    that forward are gi+1, gi+2, ... (handles the multi-token genprefix pass)."""
+    global _DECODE_START_GI
+    _DECODE_START_GI = int(gi)
+
+
 def build_region_idx(T: int, sys_end: int, doc_spans, device) -> torch.Tensor:
-    """Tag each key with its region id: 0/1/2/3."""
+    """Tag each key with its region id: 0/1/2/3 (4-region, prefill question)."""
     idx = torch.full((T,), 3, dtype=torch.long, device=device)  # default = rest
     idx[1:sys_end] = 1                                          # sys excl sink
     idx[0] = 0                                                  # sink
     for ds, de in doc_spans:
         idx[ds:de] = 2                                          # docs
+    return idx
+
+
+def build_region_idx5(prompt_len: int, sys_end: int, q_lo: int, q_hi: int,
+                      doc_spans, device) -> torch.Tensor:
+    """Tag prompt keys [0, prompt_len) with the 5-region id:
+       0=sink 1=sys_excl 2=docs 3=question (4=rest is the default for keys
+       beyond prompt_len, added at apply time)."""
+    idx = torch.full((prompt_len,), 4, dtype=torch.long, device=device)  # default rest
+    idx[1:sys_end] = 1
+    idx[0] = 0
+    for ds, de in doc_spans:
+        idx[ds:de] = 2
+    idx[q_lo:q_hi] = 3
     return idx
 
 
@@ -124,10 +178,14 @@ def _patched_attention_forward(
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
-    # === RESCALE QUESTION ROWS =========================================== #
+    # === RESCALE QUESTION ROWS (prefill) ================================= #
     ctx = _CTX
     if ctx is not None and self.layer_idx is not None:
         attn_weights = _apply_rescale(attn_weights, ctx, self.layer_idx)
+    # === RESCALE GENERATION ROWS (decode) =============================== #
+    dctx = _DECODE_CTX
+    if dctx is not None and self.layer_idx is not None:
+        attn_weights = _apply_decode_rescale(attn_weights, dctx, _DECODE_START_GI, self.layer_idx)
     # ===================================================================== #
 
     # NB: we ALWAYS return attn_weights (never None-out) so that downstream
@@ -187,6 +245,55 @@ def _apply_rescale(attn_weights: torch.Tensor, ctx: RescaleContext, layer_idx: i
 
     # In-place: avoid 575 MB clone for 8B + T=3000.
     attn_weights[:, :, q_lo:q_hi, :] = rescaled.to(attn_weights.dtype)
+    return attn_weights
+
+
+def _apply_decode_rescale(attn_weights: torch.Tensor, ctx: DecodeRescaleContext,
+                          start_gi: int, layer_idx: int) -> torch.Tensor:
+    """Rescale decode (generation) query rows over 5 regions.
+
+    attn_weights: (B=1, H, Q, T). Q is the number of query rows in this forward
+    (Q=len(genprefix) for the first decode pass, Q=1 afterward). Query row j has
+    gi = start_gi + j and attends causally to keys [0, prompt_len + start_gi + j].
+    """
+    B, H, Q, T = attn_weights.shape
+    if B != 1:
+        return attn_weights
+    device = attn_weights.device
+    max_gi = ctx.targets.shape[0]
+
+    # region_idx over the current key axis [0, T): prompt part fixed, rest=4 beyond.
+    region_idx = torch.full((T,), 4, dtype=torch.long, device=device)
+    pl = min(ctx.prompt_len, T)
+    region_idx[:pl] = ctx.prompt_region_idx[:pl].to(device)
+    one_hot = nn.functional.one_hot(region_idx, num_classes=5).to(torch.float32)  # (T, 5)
+
+    eps = 1e-8
+    alpha = float(getattr(ctx, "strength", 1.0))
+    for j in range(Q):
+        gi = start_gi + j
+        if gi >= max_gi:
+            continue
+        t = ctx.targets[gi, layer_idx].to(device=device, dtype=torch.float32)  # (H, 4)
+        aq = attn_weights[0, :, j, :].float()                                   # (H, T)
+        mass = aq @ one_hot                                                     # (H, 5) current region dist
+
+        t_sink = t[:, 0]; t_sys = t[:, 1]; t_docs = t[:, 2]; t_q = t[:, 3]
+        t_sys_excl = (t_sys - t_sink).clamp_min(0.0)
+        t_rest     = (1.0 - t_sys - t_docs - t_q).clamp_min(0.0)
+        tgt = torch.stack([t_sink, t_sys_excl, t_docs, t_q, t_rest], dim=-1)    # (H, 5)
+        tgt = tgt / tgt.sum(-1, keepdim=True).clamp_min(eps)
+
+        # Interpolate target toward current by strength alpha (alpha=1 -> full
+        # target, alpha=0 -> identity). Working in distribution space keeps the
+        # per-region multiplier = eff/current well-behaved.
+        cur = mass / mass.sum(-1, keepdim=True).clamp_min(eps)
+        eff = (1.0 - alpha) * cur + alpha * tgt
+        mult5 = eff / mass.clamp_min(eps)                                        # (H, 5)
+        mult  = mult5[:, region_idx]                                             # (H, T)
+        resc = aq * mult
+        resc = resc / resc.sum(-1, keepdim=True).clamp_min(eps)
+        attn_weights[0, :, j, :] = resc.to(attn_weights.dtype)
     return attn_weights
 
 
@@ -334,3 +441,188 @@ def _build_and_set_context_for_batch(model, segment_ids_row, n_layers, n_heads, 
         targets=targets, q_lo=q_span[0], q_hi=q_span[1],
         sys_end=sys_span[1], region_idx=region_idx,
     ))
+
+
+# ============ CLEAN question-row prefill rescaler (block_qa GBM) =========== #
+# Feature schema MUST match train_attn_score_gbm_q.py CONT_FEATS + CAT_FEATS.
+# This replaces the legacy _build_features/_build_and_set_context_for_batch
+# (which used the 14-feat eval-benchmark-trained models, attn_score_models/) with
+# the clean block_qa-trained question GBMs (attn_score_q_models/).
+_Q_CONT_FEATS = [
+    "qi", "q_len", "n_docs", "docs_total_len", "mean_doc_len", "sys_len",
+    "pre_q_len", "cur_pos", "qi_to_q_len", "q_to_docs_ratio",
+]
+_Q_DEFAULT_DIR = "analysis/attention_score_analysis/attn_score_q_models"
+
+
+def _ensure_q_rescale_ready(model, gbm_dir: str = _Q_DEFAULT_DIR):
+    """Lazy: install attention patch + load the 3 clean question GBM regressors."""
+    import os
+    if not getattr(model, "_rescale_patch_installed", False):
+        install_rescale_patch(model)
+        model._rescale_patch_installed = True
+    if not hasattr(model, "_q_rescale_gbms"):
+        import joblib
+        from pathlib import Path
+        gbm_dir = os.environ.get("KVMOD_Q_GBM_DIR", gbm_dir)
+        p = Path(gbm_dir)
+        if not p.exists():
+            raise FileNotFoundError(
+                f"recover_attn_score_q/_qg: clean question GBM dir {p} not found. "
+                "Set KVMOD_Q_GBM_DIR or place sink/sys/docs.joblib there."
+            )
+        model._q_rescale_gbms = {
+            k: joblib.load(p / f"{k}.joblib")["model"] for k in ("sink", "sys", "docs")
+        }
+
+
+def _build_q_features(sys_span, doc_spans, q_span, n_layers, n_heads):
+    """Per-(layer, head, qi) feature matrix matching train_attn_score_gbm_q.py."""
+    import numpy as np
+    q_lo, q_hi = q_span
+    q_len = q_hi - q_lo
+    if q_len <= 0:
+        return np.zeros((0, len(_Q_CONT_FEATS) + 2), dtype=np.float32)
+    doc_lens = [de - ds for (ds, de) in doc_spans]
+    docs_total_len = float(sum(doc_lens))
+    n_docs = float(len(doc_lens))
+    mean_doc = float(np.mean(doc_lens)) if doc_lens else 0.0
+    sys_len = float(sys_span[1] - sys_span[0])
+    pre_q_len = sys_len + docs_total_len
+
+    qi_arr = np.arange(q_len, dtype=np.float32)
+    cont = np.stack([
+        qi_arr,
+        np.full(q_len, q_len, np.float32),
+        np.full(q_len, n_docs, np.float32),
+        np.full(q_len, docs_total_len, np.float32),
+        np.full(q_len, mean_doc, np.float32),
+        np.full(q_len, sys_len, np.float32),
+        np.full(q_len, pre_q_len, np.float32),
+        pre_q_len + qi_arr,                                  # cur_pos
+        qi_arr / max(q_len, 1),                              # qi_to_q_len
+        np.full(q_len, q_len / max(docs_total_len, 1.0), np.float32),  # q_to_docs_ratio
+    ], axis=1)  # (q_len, 10)
+
+    n_cont = cont.shape[1]
+    out = np.empty((n_layers, n_heads, q_len, n_cont + 2), dtype=np.float32)
+    out[..., :n_cont] = cont[None, None, :, :]
+    layer_grid = np.arange(n_layers, dtype=np.float32)[:, None, None]
+    head_grid = np.arange(n_heads, dtype=np.float32)[None, :, None]
+    out[..., n_cont] = np.broadcast_to(layer_grid, (n_layers, n_heads, q_len))
+    out[..., n_cont + 1] = np.broadcast_to(head_grid, (n_layers, n_heads, q_len))
+    return out.reshape(-1, n_cont + 2)
+
+
+def _build_and_set_q_context_for_batch(model, segment_ids_row, n_layers, n_heads, device):
+    """Predict 3 clean question targets and set the prefill RescaleContext (4-region)."""
+    import numpy as np
+    sys_span, doc_spans, q_span = _spans_from_segment_ids(segment_ids_row)
+    X = _build_q_features(sys_span, doc_spans, q_span, n_layers, n_heads)
+    if X.shape[0] == 0:
+        set_rescale_context(None)
+        return
+    g = model._q_rescale_gbms
+    preds = np.stack([g["sink"].predict(X), g["sys"].predict(X), g["docs"].predict(X)], axis=-1)
+    q_len = q_span[1] - q_span[0]
+    preds = np.clip(preds, 0.0, 1.0).reshape(n_layers, n_heads, q_len, 3)
+    targets = torch.from_numpy(preds).to(device=device, dtype=torch.float32)
+    seq_len = sum(1 for s in segment_ids_row if s != -1)
+    region_idx = build_region_idx(T=seq_len, sys_end=sys_span[1],
+                                   doc_spans=doc_spans, device=device)
+    set_rescale_context(RescaleContext(
+        targets=targets, q_lo=q_span[0], q_hi=q_span[1],
+        sys_end=sys_span[1], region_idx=region_idx,
+    ))
+
+
+# ===================== DECODE (generation-row) rescaler ==================== #
+# Feature schema MUST match train_attn_score_gbm_gen.py CONT_FEATS + CAT_FEATS.
+_GEN_CONT_FEATS = [
+    "gi", "q_len", "n_docs", "docs_total_len", "mean_doc_len", "sys_len",
+    "prompt_len", "cur_pos", "q_to_prompt_ratio", "q_to_docs_ratio", "gi_to_q_len",
+]
+_GEN_DEFAULT_DIR = "analysis/attention_score_analysis/attn_score_gen_models"
+
+
+def _ensure_gen_rescale_ready(model, gbm_dir: str = _GEN_DEFAULT_DIR):
+    """Lazy: install attention patch + load the 4 gen-token GBM regressors."""
+    import os
+    if not getattr(model, "_rescale_patch_installed", False):
+        install_rescale_patch(model)
+        model._rescale_patch_installed = True
+    if not hasattr(model, "_gen_rescale_gbms"):
+        import joblib
+        from pathlib import Path
+        gbm_dir = os.environ.get("KVMOD_GEN_GBM_DIR", gbm_dir)
+        p = Path(gbm_dir)
+        if not p.exists():
+            raise FileNotFoundError(
+                f"recover_attn_score_gen: gen GBM dir {p} not found. "
+                "Set KVMOD_GEN_GBM_DIR or place sink/sys/docs/question.joblib there."
+            )
+        model._gen_rescale_gbms = {
+            k: joblib.load(p / f"{k}.joblib")["model"]
+            for k in ("sink", "sys", "docs", "question")
+        }
+
+
+def build_gen_decode_context(model, segment_ids_row, n_layers, n_heads,
+                             max_gi, device) -> DecodeRescaleContext:
+    """Derive spans from a single sample's segment_ids, predict the entire
+    (gi, layer, head) -> (sink, sys, docs, question) target grid in ONE batched
+    GBM call (amortized — no per-decode-step prediction), and return the context.
+    """
+    import numpy as np
+    sys_span, doc_spans, q_span = _spans_from_segment_ids(segment_ids_row)
+    sys_end = sys_span[1]
+    q_lo, q_hi = q_span
+    q_len = q_hi - q_lo
+    doc_lens = [de - ds for (ds, de) in doc_spans]
+    docs_total_len = float(sum(doc_lens))
+    n_docs = float(len(doc_lens))
+    mean_doc = float(np.mean(doc_lens)) if doc_lens else 0.0
+    sys_len = float(sys_end)
+    prompt_len = int(q_hi)  # question is the last prompt segment
+
+    gi_arr = np.arange(max_gi, dtype=np.float32)
+    cont = np.stack([
+        gi_arr,
+        np.full(max_gi, q_len, np.float32),
+        np.full(max_gi, n_docs, np.float32),
+        np.full(max_gi, docs_total_len, np.float32),
+        np.full(max_gi, mean_doc, np.float32),
+        np.full(max_gi, sys_len, np.float32),
+        np.full(max_gi, float(prompt_len), np.float32),
+        float(prompt_len) + gi_arr,                                   # cur_pos
+        np.full(max_gi, q_len / max(prompt_len, 1), np.float32),      # q_to_prompt_ratio
+        np.full(max_gi, q_len / max(docs_total_len, 1.0), np.float32),# q_to_docs_ratio
+        gi_arr / max(q_len, 1),                                        # gi_to_q_len
+    ], axis=1)  # (max_gi, 11)
+
+    n_cont = cont.shape[1]
+    X = np.empty((max_gi, n_layers, n_heads, n_cont + 2), dtype=np.float32)
+    X[..., :n_cont] = cont[:, None, None, :]
+    layer_grid = np.arange(n_layers, dtype=np.float32)[None, :, None]
+    head_grid  = np.arange(n_heads,  dtype=np.float32)[None, None, :]
+    X[..., n_cont]     = np.broadcast_to(layer_grid, (max_gi, n_layers, n_heads))
+    X[..., n_cont + 1] = np.broadcast_to(head_grid,  (max_gi, n_layers, n_heads))
+    Xf = X.reshape(-1, n_cont + 2)
+
+    g = model._gen_rescale_gbms
+    preds = np.stack([g["sink"].predict(Xf), g["sys"].predict(Xf),
+                      g["docs"].predict(Xf), g["question"].predict(Xf)], axis=-1)
+    preds = np.clip(preds, 0.0, 1.0).reshape(max_gi, n_layers, n_heads, 4)
+    targets = torch.from_numpy(preds).to(device=device, dtype=torch.float32)
+
+    prompt_region_idx = build_region_idx5(
+        prompt_len=prompt_len, sys_end=sys_end, q_lo=q_lo, q_hi=q_hi,
+        doc_spans=doc_spans, device=device,
+    )
+    import os
+    strength = float(os.environ.get("KVMOD_GEN_STRENGTH", "1.0"))
+    return DecodeRescaleContext(
+        targets=targets, prompt_len=prompt_len, sys_end=sys_end,
+        q_lo=q_lo, q_hi=q_hi, doc_spans=doc_spans,
+        prompt_region_idx=prompt_region_idx, strength=strength,
+    )

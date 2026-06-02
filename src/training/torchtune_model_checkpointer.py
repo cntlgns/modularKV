@@ -2,6 +2,8 @@
 Load pre-trained Llama model weights following torchtune.
 """
 import gc
+import glob
+import os
 from typing import Any, Dict
 
 import torch
@@ -17,7 +19,14 @@ MODEL_CONFIG_DICT = {
         "num_key_value_heads": 8,
         "hidden_size": 2048,
         "head_dim": 64,
-    }
+    },
+    "meta-llama/Llama-3.1-8B-Instruct": {
+        "num_attention_heads": 32,
+        "num_hidden_layers": 32,
+        "num_key_value_heads": 8,
+        "hidden_size": 4096,
+        "head_dim": 128,
+    },
 }
 
 def load_checkpoint(
@@ -52,13 +61,24 @@ def load_checkpoint(
     # the recipe state and adapter weights
     converted_state_dict: Dict[str, Dict[str, torch.Tensor]] = {}
 
-    # _checkpoint_paths are already sorted so simply enumerate to generate the right id
-    state_dict = safe_torch_load(ckpt_path)
-    merged_state_dict.update(state_dict)
+    # Accept either a single safetensors file (e.g. 1B) or a directory holding
+    # sharded safetensors (e.g. 8B's model-0000{1..4}-of-00004.safetensors).
+    if os.path.isdir(ckpt_path):
+        shard_paths = sorted(glob.glob(os.path.join(ckpt_path, "model-*-of-*.safetensors")))
+        if not shard_paths:
+            single = os.path.join(ckpt_path, "model.safetensors")
+            if os.path.isfile(single):
+                shard_paths = [single]
+            else:
+                raise FileNotFoundError(f"No safetensors files found under {ckpt_path}")
+    else:
+        shard_paths = [ckpt_path]
 
-    # delete the state_dict to free up memory; TODO check if this del is needed
-    del state_dict
-    gc.collect()
+    for p in shard_paths:
+        state_dict = safe_torch_load(p)
+        merged_state_dict.update(state_dict)
+        del state_dict
+        gc.collect()
 
     cfg_dict = MODEL_CONFIG_DICT[model_name]
     converted_state_dict = convert_weights.hf_to_tune(
