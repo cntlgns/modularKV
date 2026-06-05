@@ -27,7 +27,9 @@ from .inference import generate_for_policy
 from .prompt import (
     PROMPT_PRESETS,
     SYSTEM_PROMPTS,
+    ChatFormat,
     build_segmented_inputs,
+    get_chat_format,
 )
 
 __all__ = [
@@ -39,5 +41,7 @@ __all__ = [
     "generate_for_policy",
     "PROMPT_PRESETS",
     "SYSTEM_PROMPTS",
+    "ChatFormat",
     "build_segmented_inputs",
+    "get_chat_format",
 ]

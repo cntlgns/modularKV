@@ -189,6 +189,8 @@ def generate_for_policy(
     max_new_tokens: int = 200,
     modular_q_pos: str = "summed_pos",
     disable_doc_k_relocalization: bool = False,
+    assistant_split: str = "<|start_header_id|>assistant<|end_header_id|>",
+    stop_split: str = "<|eot_id|>",
 ) -> list[str]:
     """Run one batch under ``policy`` and return the decoded responses.
 
@@ -196,6 +198,25 @@ def generate_for_policy(
     with the original eval split applied:
     ``... .split("assistant<|end_header_id|>")[-1].strip().split("<|eot_id|>")[0]``.
     """
+    if policy in ("oracle_ab_vrec", "oracle_arec_vbase", "oracle_ab_vbase"):
+        if policy == "oracle_arec_vbase":
+            return generate_dual_stream_arec_vbase(
+                model, tokenizer,
+                input_ids=input_ids, pad_mask=pad_mask, segment_ids=segment_ids,
+                generation_token_ids=generation_token_ids,
+                stop_token_ids=stop_token_ids, max_new_tokens=max_new_tokens,
+            )
+        # oracle_ab_vbase is a CONTROL: H prefills prompt/docs under the baseline
+        # causal mask (so cache_H holds V_base), then A_base is injected -> the
+        # whole thing is A_base @ V_base and MUST reproduce baseline exactly.
+        return generate_dual_stream(
+            model, tokenizer,
+            input_ids=input_ids, pad_mask=pad_mask, segment_ids=segment_ids,
+            generation_token_ids=generation_token_ids,
+            stop_token_ids=stop_token_ids, max_new_tokens=max_new_tokens,
+            control_vbase=(policy == "oracle_ab_vbase"),
+        )
+
     device = next(model.parameters()).device
     input_ids = input_ids.to(device)
     pad_mask = pad_mask.to(device)
@@ -356,10 +377,293 @@ def generate_for_policy(
 
     decoded = [tokenizer.decode(s) for s in seqs]
     return [
-        d.split("<|start_header_id|>assistant<|end_header_id|>")[-1]
+        d.split(assistant_split)[-1]
+        .strip()
+        .split(stop_split)[0]
+        for d in decoded
+    ]
+
+
+@torch.no_grad()
+def generate_dual_stream(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    input_ids: torch.Tensor,        # (1, T) right-padded
+    pad_mask: torch.Tensor,         # (1, T) 1 real / 0 pad
+    segment_ids: torch.Tensor,      # (1, T) 0 prefix/q, >=1 doc, -1 pad
+    generation_token_ids: torch.Tensor,  # (G,) chat assistant-turn prefix
+    stop_token_ids,
+    max_new_tokens: int = 200,
+    control_vbase: bool = False,
+) -> list[str]:
+    """Oracle ``oracle_ab_vrec``: question + decode rows use the BASELINE
+    attention scores A_B (from a parallel full-causal stream) multiplied by the
+    recover_pos_enc VALUES.
+
+    Two coupled streams share the same token sequence (B drives nothing of its
+    own; it is teacher-forced with the tokens the hybrid stream H generates, so
+    A_B is always defined at decode):
+
+      * Stream B -- ordinary baseline (full causal, contiguous pos). Its
+        post-softmax attention is captured per layer ("capture" mode) for the
+        question rows during prefill and for every decode row.
+      * Stream H -- prompt+docs prefilled under the recover_pos_enc mask (so
+        the cached doc K/V are the *broken* ones), then question prefill and
+        decode run in "inject" mode: each layer replaces softmax(QK) with the
+        captured A_B and multiplies by H's own (recover) values.
+
+    Requires batch_size == 1 (per-sample spans + A_B capture/inject).
+    """
+    from .attn_rescale import (
+        install_rescale_patch, set_dual_mode, set_ab_capture_qlo,
+        clear_ab_store, set_rescale_context, set_decode_context,
+    )
+
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    pad_mask = pad_mask.to(device)
+    segment_ids = segment_ids.to(device)
+    if input_ids.shape[0] != 1:
+        raise NotImplementedError(
+            "oracle_ab_vrec requires batch_size=1; got B=%d" % input_ids.shape[0]
+        )
+
+    if not getattr(model, "_rescale_patch_installed", False):
+        install_rescale_patch(model)
+        model._rescale_patch_installed = True
+    set_rescale_context(None)
+    set_decode_context(None)
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    stop_ids = set(int(x) for x in stop_token_ids)
+
+    pf_base = build_policy_prefill(segment_ids, "baseline", dtype=model.dtype)
+    pf_rec = build_policy_prefill(segment_ids, "recover_pos_enc", dtype=model.dtype)
+    pos = pf_base.position_ids.to(device)             # (1, T) contiguous
+    q_start = pf_base.question_start[0]               # start of question band
+    q_end = int(pad_mask[0].sum().item())             # one past last real token
+    rec_mask = pf_rec.attention_mask_4d.to(device=device, dtype=model.dtype)  # (1,1,T,T)
+
+    cache_B = DynamicCache()
+    cache_H = DynamicCache()
+
+    # ---- Phase 1: baseline prefill [0:q_end]; capture A_B question rows --- #
+    set_dual_mode("capture")
+    set_ab_capture_qlo(q_start)        # keep rows [q_start:q_end) = question band
+    clear_ab_store()
+    outB = model(
+        input_ids=input_ids[:, :q_end],
+        attention_mask=pad_mask[:, :q_end],
+        position_ids=pos[:, :q_end],
+        past_key_values=cache_B, use_cache=True,
+    )
+    cache_B = outB.past_key_values
+
+    # ---- Phase 2: H prompt+docs prefill -> cache_H values --------------- #
+    # recover mask => broken V_rec (oracle_ab_vrec). control_vbase swaps in the
+    # baseline causal mask => V_base, making the whole run A_base @ V_base, which
+    # must reproduce baseline (harness sanity check).
+    set_dual_mode(None)
+    h_pd_mask = (pad_mask[:, :q_start] if control_vbase
+                 else rec_mask[:, :, :q_start, :q_start])
+    outH1 = model(
+        input_ids=input_ids[:, :q_start],
+        attention_mask=h_pd_mask,
+        position_ids=pos[:, :q_start],
+        past_key_values=cache_H, use_cache=True,
+    )
+    cache_H = outH1.past_key_values
+
+    # ---- Phase 3: H question inject [q_start:q_end] = A_B @ V_rec --------- #
+    set_dual_mode("inject")
+    qmask = torch.ones((1, q_end), device=device, dtype=pad_mask.dtype)
+    outH2 = model(
+        input_ids=input_ids[:, q_start:q_end],
+        attention_mask=qmask,
+        position_ids=pos[:, q_start:q_end],
+        past_key_values=cache_H, use_cache=True,
+    )
+    cache_H = outH2.past_key_values
+
+    # ---- Phase 4: lockstep decode (B captures, H injects, H generates) ---- #
+    total = q_end                      # both caches hold this many tokens
+    next_pos = q_end
+
+    def dual_step(chunk: torch.Tensor) -> torch.Tensor:
+        """Forward `chunk` (1, L) through B (capture, all rows) then H (inject);
+        returns H's logits (1, L, V). Advances both caches + position counter."""
+        nonlocal cache_B, cache_H, total, next_pos
+        L = chunk.shape[1]
+        positions = torch.arange(next_pos, next_pos + L, device=device).view(1, L)
+        attn = torch.ones((1, total + L), device=device, dtype=pad_mask.dtype)
+        # Stream B: capture every row of this chunk.
+        set_dual_mode("capture"); set_ab_capture_qlo(0); clear_ab_store()
+        ob = model(input_ids=chunk, attention_mask=attn, position_ids=positions,
+                   past_key_values=cache_B, use_cache=True)
+        cache_B = ob.past_key_values
+        # Stream H: inject A_B, multiply by recover V.
+        set_dual_mode("inject")
+        oh = model(input_ids=chunk, attention_mask=attn, position_ids=positions,
+                   past_key_values=cache_H, use_cache=True)
+        cache_H = oh.past_key_values
+        total += L
+        next_pos += L
+        return oh.logits
+
+    genprefix = generation_token_ids.to(device).view(1, -1)
+    logits = dual_step(genprefix)
+    next_tok = logits[:, -1, :].argmax(dim=-1)   # (1,)
+
+    seq: list[int] = genprefix[0].tolist()
+    for _ in range(max_new_tokens):
+        t = int(next_tok.item())
+        if t in stop_ids:
+            break
+        seq.append(t)
+        logits = dual_step(next_tok.view(1, 1))
+        next_tok = logits[:, -1, :].argmax(dim=-1)
+
+    set_dual_mode(None)
+    clear_ab_store()
+
+    decoded = tokenizer.decode(seq)
+    return [
+        decoded.split("<|start_header_id|>assistant<|end_header_id|>")[-1]
         .strip()
         .split("<|eot_id|>")[0]
-        for d in decoded
+    ]
+
+
+@torch.no_grad()
+def generate_dual_stream_arec_vbase(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    input_ids: torch.Tensor,        # (1, T) right-padded
+    pad_mask: torch.Tensor,         # (1, T) 1 real / 0 pad
+    segment_ids: torch.Tensor,      # (1, T) 0 prefix/q, >=1 doc, -1 pad
+    generation_token_ids: torch.Tensor,  # (G,) chat assistant-turn prefix
+    stop_token_ids,
+    max_new_tokens: int = 200,
+) -> list[str]:
+    """Mirror oracle ``oracle_arec_vbase``: the whole forward follows the
+    recover_pos_enc computation (block-diagonal prefill mask -> its own
+    attention scores A_rec) but every layer's output matmul uses the BASELINE
+    values V_base instead of the recover values.
+
+      * Stream B -- ordinary baseline (full causal). Its value cache supplies
+        V_base for every token; teacher-forced with H's generated tokens.
+      * Stream H -- recover_pos_enc attention (own Q/K, block-diagonal prefill
+        mask) but ``inject_value`` mode swaps V for stream B's cached V_base.
+
+    Unlike oracle_ab_vrec there is no separate "produce broken V" prefill: H
+    never uses its own values, so it prefills the whole prompt in one pass.
+    Requires batch_size == 1.
+    """
+    from .attn_rescale import (
+        install_rescale_patch, set_dual_mode, set_vbase_provider,
+        clear_ab_store, set_rescale_context, set_decode_context,
+    )
+
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    pad_mask = pad_mask.to(device)
+    segment_ids = segment_ids.to(device)
+    if input_ids.shape[0] != 1:
+        raise NotImplementedError(
+            "oracle_arec_vbase requires batch_size=1; got B=%d" % input_ids.shape[0]
+        )
+
+    if not getattr(model, "_rescale_patch_installed", False):
+        install_rescale_patch(model)
+        model._rescale_patch_installed = True
+    set_rescale_context(None)
+    set_decode_context(None)
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    stop_ids = set(int(x) for x in stop_token_ids)
+
+    pf_base = build_policy_prefill(segment_ids, "baseline", dtype=model.dtype)
+    pf_rec = build_policy_prefill(segment_ids, "recover_pos_enc", dtype=model.dtype)
+    pos = pf_base.position_ids.to(device)             # (1, T) contiguous
+    q_end = int(pad_mask[0].sum().item())
+    rec_mask = pf_rec.attention_mask_4d.to(device=device, dtype=model.dtype)
+
+    cache_B = DynamicCache()
+    cache_H = DynamicCache()
+
+    # ---- Phase 1: baseline prefill [0:q_end] -> cache_B holds V_base ------- #
+    set_dual_mode(None)
+    set_vbase_provider(None)
+    outB = model(
+        input_ids=input_ids[:, :q_end],
+        attention_mask=pad_mask[:, :q_end],
+        position_ids=pos[:, :q_end],
+        past_key_values=cache_B, use_cache=True,
+    )
+    cache_B = outB.past_key_values
+
+    # ---- Phase 2: H recover prefill [0:q_end], A_rec @ V_base ------------- #
+    set_vbase_provider(cache_B)
+    set_dual_mode("inject_value")
+    outH = model(
+        input_ids=input_ids[:, :q_end],
+        attention_mask=rec_mask[:, :, :q_end, :q_end],
+        position_ids=pos[:, :q_end],
+        past_key_values=cache_H, use_cache=True,
+    )
+    cache_H = outH.past_key_values
+
+    # ---- Phase 3: lockstep decode (B supplies V_base, H generates) -------- #
+    total = q_end
+    next_pos = q_end
+
+    def dual_step(chunk: torch.Tensor) -> torch.Tensor:
+        nonlocal cache_B, cache_H, total, next_pos
+        L = chunk.shape[1]
+        positions = torch.arange(next_pos, next_pos + L, device=device).view(1, L)
+        attn = torch.ones((1, total + L), device=device, dtype=pad_mask.dtype)
+        # Stream B: ordinary baseline; advances V_base cache.
+        set_dual_mode(None); set_vbase_provider(None)
+        ob = model(input_ids=chunk, attention_mask=attn, position_ids=positions,
+                   past_key_values=cache_B, use_cache=True)
+        cache_B = ob.past_key_values
+        # Stream H: recover attention (causal at decode), baseline values.
+        set_vbase_provider(cache_B); set_dual_mode("inject_value")
+        oh = model(input_ids=chunk, attention_mask=attn, position_ids=positions,
+                   past_key_values=cache_H, use_cache=True)
+        cache_H = oh.past_key_values
+        total += L
+        next_pos += L
+        return oh.logits
+
+    genprefix = generation_token_ids.to(device).view(1, -1)
+    logits = dual_step(genprefix)
+    next_tok = logits[:, -1, :].argmax(dim=-1)
+
+    seq: list[int] = genprefix[0].tolist()
+    for _ in range(max_new_tokens):
+        t = int(next_tok.item())
+        if t in stop_ids:
+            break
+        seq.append(t)
+        logits = dual_step(next_tok.view(1, 1))
+        next_tok = logits[:, -1, :].argmax(dim=-1)
+
+    set_dual_mode(None)
+    set_vbase_provider(None)
+    clear_ab_store()
+
+    decoded = tokenizer.decode(seq)
+    return [
+        decoded.split("<|start_header_id|>assistant<|end_header_id|>")[-1]
+        .strip()
+        .split("<|eot_id|>")[0]
     ]
 
 

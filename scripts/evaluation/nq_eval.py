@@ -41,6 +41,7 @@ from src.kvmod import (
     PROMPT_PRESETS,
     build_segmented_inputs,
     generate_for_policy,
+    get_chat_format,
 )
 from src.utils.metrics import score_sample
 
@@ -137,7 +138,7 @@ def load_model_weights(ckpt_path: str):
 # were consolidated into src.utils.metrics -- see score_sample, imported above.
 # substring accuracy is byte-for-byte unchanged from the old inline version.
 
-def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, prompt_preset: str = "kvlink", gold_only: bool = False):
+def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_position: int, reencode_num: int, mem_start: int, mem_end: int, special_token_start:int, prompt_preset: str = "kvlink", gold_only: bool = False, chat_format=None):
     question = example["question"]
 
     if gold_only:
@@ -163,6 +164,7 @@ def preprocess_fn(example: Dict[str, str], tokenizer: LLaMA32Tokenizer, target_p
         prompt_preset=prompt_preset, reencode_num=reencode_num,
         mem_start=mem_start, mem_end=mem_end,
         special_token_start=special_token_start,
+        chat_format=chat_format,
     )
 
 class DataCollatorForGeneration():
@@ -221,6 +223,7 @@ def main():
     # tokenizer = LLaMA32Tokenizer(model_path="data/titan_tokenizer/original/tokenizer.model")
     model_name = args.model_name or (args.ckpt_path if (hf and args.ckpt_path) else "meta-llama/Llama-3.2-1B-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
+    chat_fmt = get_chat_format(model_name)
     if "Llama-3.2" in model_name:
         # Original KVLink setup: reserved Llama-3.2 special-token ids.
         tokenizer.pad_token_id = 128004
@@ -260,6 +263,7 @@ def main():
             mem_end=mem_end,
             special_token_start=special_token_start,
             prompt_preset=args.prompt_preset,
+            chat_format=chat_fmt,
             gold_only=args.gold_only,
         ),
     )
@@ -281,12 +285,11 @@ def main():
     # stops on these ids (token-for-token identical to the old greedy decode).
     stop_token_ids = {
         i for i in (
-            tokenizer.convert_tokens_to_ids("<|eot_id|>"),
-            tokenizer.convert_tokens_to_ids("<|end_of_text|>"),
+            *[tokenizer.convert_tokens_to_ids(s) for s in chat_fmt.stop_strings],
             tokenizer.eos_token_id,
         ) if i is not None and i >= 0
     }
-    generation_prompt = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+    generation_prompt = chat_fmt.gen_prompt
     generation_token_ids = tokenizer(generation_prompt, add_special_tokens=False)["input_ids"]
     generation_token_ids = torch.LongTensor(generation_token_ids)
     generation_token_ids = move_to_target_device(generation_token_ids, device)
@@ -304,6 +307,8 @@ def main():
             policy=policy,
             generation_token_ids=generation_token_ids,
             stop_token_ids=stop_token_ids,
+            assistant_split=chat_fmt.assistant_split,
+            stop_split=chat_fmt.stop_split,
             max_new_tokens=200,
             modular_q_pos=args.modular_q_pos,
         )
