@@ -34,6 +34,22 @@ from .policies import build_policy_prefill, PolicyPrefill
 # transformers 4.46 legacy DynamicCache (key_cache / value_cache lists).
 # --------------------------------------------------------------------------- #
 
+def _cache_num_layers(cache) -> int:
+    """Number of populated layers, across DynamicCache layouts (transformers
+    4.46 ``key_cache`` list vs >=4.54 ``.layers``)."""
+    if hasattr(cache, "layers"):
+        return len(cache.layers)
+    return len(cache.key_cache)
+
+
+def _cache_kv(cache, layer: int):
+    """Return (K, V) for ``layer`` across DynamicCache layouts."""
+    if hasattr(cache, "layers"):
+        lay = cache.layers[layer]
+        return lay.keys, lay.values
+    return cache.key_cache[layer], cache.value_cache[layer]
+
+
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
     half = x.shape[-1] // 2
     return torch.cat((-x[..., half:], x[..., :half]), dim=-1)
@@ -198,6 +214,21 @@ def generate_for_policy(
     with the original eval split applied:
     ``... .split("assistant<|end_header_id|>")[-1].strip().split("<|eot_id|>")[0]``.
     """
+    if policy in ("swap_docbase_qrec", "swap_docrec_qbase"):
+        doc_policy, q_policy = (
+            ("baseline", "recover_pos_enc")
+            if policy == "swap_docbase_qrec"
+            else ("recover_pos_enc", "baseline")
+        )
+        return generate_kv_swap(
+            model, tokenizer,
+            input_ids=input_ids, pad_mask=pad_mask, segment_ids=segment_ids,
+            doc_policy=doc_policy, q_policy=q_policy,
+            generation_token_ids=generation_token_ids,
+            stop_token_ids=stop_token_ids, max_new_tokens=max_new_tokens,
+            assistant_split=assistant_split, stop_split=stop_split,
+        )
+
     if policy in ("oracle_ab_vrec", "oracle_arec_vbase", "oracle_ab_vbase"):
         if policy == "oracle_arec_vbase":
             return generate_dual_stream_arec_vbase(
@@ -380,6 +411,124 @@ def generate_for_policy(
         d.split(assistant_split)[-1]
         .strip()
         .split(stop_split)[0]
+        for d in decoded
+    ]
+
+
+@torch.no_grad()
+def generate_kv_swap(
+    model: PreTrainedModel,
+    tokenizer: PreTrainedTokenizerBase,
+    *,
+    input_ids: torch.Tensor,        # (1, T) right-padded
+    pad_mask: torch.Tensor,         # (1, T) 1 real / 0 pad
+    segment_ids: torch.Tensor,      # (1, T) 0 prefix/q, >=1 doc, -1 pad
+    doc_policy: str,                # "baseline" | "recover_pos_enc" (doc band)
+    q_policy: str,                  # "baseline" | "recover_pos_enc" (question band)
+    generation_token_ids: torch.Tensor,  # (G,) chat assistant-turn prefix
+    stop_token_ids,
+    max_new_tokens: int = 200,
+    assistant_split: str = "<|start_header_id|>assistant<|end_header_id|>",
+    stop_split: str = "<|eot_id|>",
+) -> list[str]:
+    """KV-cache swap between ``baseline`` and ``recover_pos_enc``.
+
+    Prefill the SAME token sequence twice -- once full-causal (baseline), once
+    block-diagonal over docs (recover_pos_enc). Both use contiguous positions,
+    so the two caches are token-aligned and position-aligned. Splice a hybrid
+    cache per layer:
+
+        positions [0 : q_start)   prefix + docs   <- ``doc_policy`` stream
+        positions [q_start : q_end) question band <- ``q_policy`` stream
+
+    The system-prefix K/V are byte-identical between the two streams (seg-0
+    tokens at the head attend only to themselves either way), so taking the
+    whole [0:q_start) slab from the doc stream changes only the doc K/V. The
+    question band's attention connectivity is also identical between the two
+    streams (seg-0 attends full-causal in both); only the doc K/V it *reads*
+    during prefill differ, which is exactly what we want to isolate. Then decode
+    greedily against the hybrid cache.
+
+    Requires batch_size == 1 (per-sample spans + per-layer cache splice).
+    """
+    if doc_policy not in ("baseline", "recover_pos_enc") or q_policy not in (
+        "baseline", "recover_pos_enc"
+    ):
+        raise ValueError(
+            f"kv_swap policies must be baseline/recover_pos_enc; "
+            f"got doc={doc_policy!r} q={q_policy!r}"
+        )
+
+    device = next(model.parameters()).device
+    input_ids = input_ids.to(device)
+    pad_mask = pad_mask.to(device)
+    segment_ids = segment_ids.to(device)
+    if input_ids.shape[0] != 1:
+        raise NotImplementedError(
+            "kv_swap requires batch_size=1; got B=%d" % input_ids.shape[0]
+        )
+
+    # Clear any leftover rescale/decode context from a prior call (defensive).
+    try:
+        from .attn_rescale import set_rescale_context, set_decode_context
+        set_rescale_context(None)
+        set_decode_context(None)
+    except Exception:
+        pass
+
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    stop_ids = set(int(x) for x in stop_token_ids)
+
+    pf_base = build_policy_prefill(segment_ids, "baseline", dtype=model.dtype)
+    pf_rec = build_policy_prefill(segment_ids, "recover_pos_enc", dtype=model.dtype)
+    # Contiguous positions are identical for both policies (asserted by design).
+    pos = pf_base.position_ids.to(device)             # (1, T)
+    q_start = pf_base.question_start[0]               # start of question band
+    q_end = int(pad_mask[0].sum().item())             # one past last real token
+    rec_mask = pf_rec.attention_mask_4d.to(device=device, dtype=model.dtype)
+
+    # ---- Prefill both streams over [0:q_end] ----------------------------- #
+    cache_base = model(
+        input_ids=input_ids[:, :q_end],
+        attention_mask=pad_mask[:, :q_end],
+        position_ids=pos[:, :q_end],
+        past_key_values=DynamicCache(), use_cache=True,
+    ).past_key_values
+    cache_rec = model(
+        input_ids=input_ids[:, :q_end],
+        attention_mask=rec_mask[:, :, :q_end, :q_end],
+        position_ids=pos[:, :q_end],
+        past_key_values=DynamicCache(), use_cache=True,
+    ).past_key_values
+
+    src_doc = cache_base if doc_policy == "baseline" else cache_rec
+    src_q = cache_base if q_policy == "baseline" else cache_rec
+
+    # ---- Splice hybrid cache: [0:q_start) from doc stream, [q_start:q_end)
+    #      from question stream, per layer. ------------------------------- #
+    hybrid = DynamicCache()
+    n_layers = _cache_num_layers(cache_base)
+    for l in range(n_layers):
+        k_doc, v_doc = _cache_kv(src_doc, l)
+        k_q, v_q = _cache_kv(src_q, l)
+        K = torch.cat([k_doc[:, :, :q_start, :], k_q[:, :, q_start:q_end, :]], dim=2)
+        V = torch.cat([v_doc[:, :, :q_start, :], v_q[:, :, q_start:q_end, :]], dim=2)
+        hybrid.update(K, V, l)
+
+    # ---- Decode greedily against the hybrid cache ------------------------ #
+    G = generation_token_ids.shape[0]
+    genprefix = generation_token_ids.to(device).unsqueeze(0).expand(1, G).contiguous()
+    decode_pad_mask = torch.ones((1, q_end), device=device, dtype=pad_mask.dtype)
+    seqs = _greedy_decode(
+        model, hybrid, genprefix, decode_pad_mask,
+        pf_base.next_position, pad_id, stop_ids, max_new_tokens,
+    )
+
+    decoded = [tokenizer.decode(s) for s in seqs]
+    return [
+        d.split(assistant_split)[-1].strip().split(stop_split)[0]
         for d in decoded
     ]
 

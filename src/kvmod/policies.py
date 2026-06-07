@@ -45,6 +45,16 @@ KV_CACHE_POLICIES = (
     # CONTROL: A_base @ V_base through the same dual-stream harness. MUST equal
     # baseline token-for-token (validates capture/inject + phasing + decode).
     "oracle_ab_vbase",
+    # KV-cache swap between baseline and recover_pos_enc. Both share contiguous
+    # positions + identical token sequence, and the question band (seg 0) has the
+    # same full-causal connectivity in both -- only the doc K/V it reads differ,
+    # and the system-prefix K/V are byte-identical. So we can prefill BOTH
+    # streams, then splice a hybrid cache: prefix+docs from one policy, the
+    # question band from the other, and decode. Isolates whether a well-restored
+    # QUESTION cache can rescue a broken (block-isolated) DOCUMENT cache, and
+    # vice versa. Routed via generate_kv_swap, NOT build_policy_prefill.
+    "swap_docbase_qrec",   # docs = baseline, question = recover_pos_enc
+    "swap_docrec_qbase",   # docs = recover_pos_enc, question = baseline
 )
 
 # Doc band isolated (no cross-doc, no prefix attention) -> use the 4-D
@@ -67,6 +77,8 @@ _USE_SEGMENT_MASK = {
     "oracle_ab_vrec": True,  # routed via generate_dual_stream, not build_policy_prefill
     "oracle_arec_vbase": True,
     "oracle_ab_vbase": True,
+    "swap_docbase_qrec": False,  # routed via generate_kv_swap, not build_policy_prefill
+    "swap_docrec_qbase": False,
 }
 
 # Doc positions during prefill: "contiguous" (global 0..T-1) or
@@ -84,6 +96,8 @@ _DOC_POS_SCHEME = {
     "oracle_ab_vrec": "contiguous",
     "oracle_arec_vbase": "contiguous",
     "oracle_ab_vbase": "contiguous",
+    "swap_docbase_qrec": "contiguous",
+    "swap_docrec_qbase": "contiguous",
 }
 
 # Post-prefill rotation of cached doc K to per-doc local RoPE positions.
