@@ -83,6 +83,45 @@ _CTX: Optional[RescaleContext] = None
 _DECODE_CTX: Optional[DecodeRescaleContext] = None
 _DECODE_START_GI: int = 0
 
+# ----------------------- dual-stream oracle state ------------------------- #
+# For policy ``oracle_ab_vrec``: a parallel full-causal "baseline" stream
+# captures its post-softmax attention scores A_B per layer; the "hybrid" stream
+# then injects A_B in place of its own softmax(QK) and multiplies by its own
+# (recover_pos_enc) values. Isolates K (routing) vs V (content) contributions.
+_DUAL_MODE: Optional[str] = None      # None | "capture" | "inject" | "inject_value"
+_AB_STORE: dict = {}                   # layer_idx -> (B, n_heads, q_rows, kv) tensor
+_AB_CAPTURE_QLO: int = 0               # capture only attn rows [qlo:, :]
+_VBASE_PROVIDER = None                  # DynamicCache whose value_cache[layer] is V_base
+
+
+def set_dual_mode(mode: Optional[str]):
+    """Dual-stream attention mode for the oracle policies:
+      None           -- ordinary attention (the baseline / value-provider stream).
+      'capture'      -- store this layer's post-softmax A per layer (A_B).
+      'inject'       -- replace softmax(QK) with the stored A_B (oracle_ab_vrec).
+      'inject_value' -- compute this stream's own softmax(QK) (A_rec) but do the
+                        output matmul against _VBASE_PROVIDER's values (oracle_arec_vbase)."""
+    global _DUAL_MODE
+    assert mode in (None, "capture", "inject", "inject_value"), mode
+    _DUAL_MODE = mode
+
+
+def set_vbase_provider(cache):
+    """Cache whose value_cache[layer_idx] supplies V_base during 'inject_value'."""
+    global _VBASE_PROVIDER
+    _VBASE_PROVIDER = cache
+
+
+def set_ab_capture_qlo(qlo: int):
+    """During 'capture', keep only query rows [qlo:, :] of A_B (the question /
+    decode rows the hybrid stream actually replays)."""
+    global _AB_CAPTURE_QLO
+    _AB_CAPTURE_QLO = int(qlo)
+
+
+def clear_ab_store():
+    _AB_STORE.clear()
+
 
 def set_rescale_context(ctx: Optional[RescaleContext]):
     global _CTX
@@ -170,13 +209,24 @@ def _patched_attention_forward(
 
     key_states_r   = repeat_kv(key_states, self.num_key_value_groups)
     value_states_r = repeat_kv(value_states, self.num_key_value_groups)
-    attn_weights = torch.matmul(query_states, key_states_r.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-    if attention_mask is not None:
-        causal_mask = attention_mask[:, :, :, : key_states_r.shape[-2]]
-        attn_weights = attn_weights + causal_mask
-
-    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    if _DUAL_MODE == "inject":
+        # Use the baseline stream's attention scores (already post-softmax,
+        # masked) instead of this stream's softmax(QK). Shape must match the
+        # current (q_len, kv_len); A_B's kv axis aligns because both streams
+        # cache the same tokens in the same order.
+        attn_weights = _AB_STORE[self.layer_idx].to(query_states.dtype)
+        if attn_weights.shape[-2:] != (q_len, key_states_r.shape[-2]):
+            raise RuntimeError(
+                f"oracle_ab_vrec inject shape {tuple(attn_weights.shape)} "
+                f"!= (q_len={q_len}, kv={key_states_r.shape[-2]}) at layer {self.layer_idx}"
+            )
+    else:
+        attn_weights = torch.matmul(query_states, key_states_r.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states_r.shape[-2]]
+            attn_weights = attn_weights + causal_mask
+        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
 
     # === RESCALE QUESTION ROWS (prefill) ================================= #
     ctx = _CTX
@@ -186,6 +236,9 @@ def _patched_attention_forward(
     dctx = _DECODE_CTX
     if dctx is not None and self.layer_idx is not None:
         attn_weights = _apply_decode_rescale(attn_weights, dctx, _DECODE_START_GI, self.layer_idx)
+    # === CAPTURE baseline scores for the dual-stream hybrid pass ========= #
+    if _DUAL_MODE == "capture" and self.layer_idx is not None:
+        _AB_STORE[self.layer_idx] = attn_weights[:, :, _AB_CAPTURE_QLO:, :].detach().clone()
     # ===================================================================== #
 
     # NB: we ALWAYS return attn_weights (never None-out) so that downstream
@@ -195,7 +248,20 @@ def _patched_attention_forward(
     # passing False at the top still saves the per-layer accumulation memory.)
     attn_weights_for_hook = attn_weights
     attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-    attn_output = torch.matmul(attn_weights, value_states_r)
+    if _DUAL_MODE == "inject_value":
+        # A_rec (this stream's own scores) @ V_base (from the baseline stream's
+        # value cache). Slice/repeat the provider's values to this stream's
+        # current key length; token order matches (both contiguous).
+        kv = key_states_r.shape[-2]
+        vb = _VBASE_PROVIDER.value_cache[self.layer_idx][:, :, :kv, :]
+        if vb.shape[-2] != kv:
+            raise RuntimeError(
+                f"oracle_arec_vbase: V_base len {vb.shape[-2]} != kv {kv} at layer {self.layer_idx}"
+            )
+        vb_r = repeat_kv(vb, self.num_key_value_groups).to(attn_weights.dtype)
+        attn_output = torch.matmul(attn_weights, vb_r)
+    else:
+        attn_output = torch.matmul(attn_weights, value_states_r)
     attn_output = attn_output.transpose(1, 2).contiguous()
     attn_output = attn_output.reshape(bsz, q_len, -1)
     attn_output = self.o_proj(attn_output)
@@ -300,7 +366,22 @@ def _apply_decode_rescale(attn_weights: torch.Tensor, ctx: DecodeRescaleContext,
 # --------------------------- install / uninstall -------------------------- #
 
 def install_rescale_patch(model):
-    """Bind the patched forward to every LlamaAttention in the model."""
+    """Bind the patched (eager) forward to every LlamaAttention in the model.
+
+    CRITICAL: also force ``config._attn_implementation = "eager"``. The patched
+    forward is an eager implementation that relies on ``attention_mask`` being a
+    materialized 4-D causal mask. Under the default ``sdpa`` implementation,
+    ``LlamaModel._update_causal_mask`` returns ``None`` for an unpadded prefill
+    (sdpa applies causality via ``is_causal`` internally) -- the eager forward
+    would then skip causal masking entirely, making the prefill BIDIRECTIONAL.
+    Forcing eager makes the model materialize the 4-D causal mask so the patched
+    forward masks correctly. (Policies that pass their own 4-D segment mask were
+    unaffected; baseline-style prefills through this patch were silently
+    bidirectional until this fix.)"""
+    model.config._attn_implementation = "eager"
+    inner = getattr(model, "model", model)
+    if hasattr(inner, "config"):
+        inner.config._attn_implementation = "eager"
     n = 0
     for module in model.modules():
         if isinstance(module, LlamaAttention):
